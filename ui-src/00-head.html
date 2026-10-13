@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-accent="black">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<link rel="icon" href="data:,">
+<title>飞牛监控</title>
+<script>
+  /* 尽早应用外观（本地缓存），避免首屏闪烁；服务器 ui.json 加载后以服务器为准 */
+  (function () {
+    try {
+      var u = JSON.parse(localStorage.getItem('fnm.ui') || 'null'), mode, acc;
+      if (u && u.layoutVersion >= 200) { mode = u.theme; acc = u.accent; }
+      else { var L = { dark: ['dark', 'black'], light: ['light', 'black'], blue: ['light', 'blue'], fresh: ['light', 'green'], green: ['light', 'green'], yellow: ['light', 'yellow'], cyan: ['light', 'cyan'] }[localStorage.getItem('fnmonitor-theme')]; if (L) { mode = L[0]; acc = L[1]; } }
+      mode = mode || 'light';
+      if (mode === 'auto') mode = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      var d = document.documentElement;
+      d.dataset.theme = mode === 'dark' ? 'dark' : 'light';
+      if (/^(black|blue|green|yellow|cyan)$/.test(acc || '')) d.dataset.accent = acc;
+      var fs = u && +u.fontScale; if (fs && fs !== 1 && fs >= 0.8 && fs <= 1.5) d.style.zoom = String(fs);
+    } catch (e) {}
+  })();
+</script>
+<style>

@@ -1,39 +1,48 @@
 # 飞牛监控 fnMonitor
 
 <p>
-  <img alt="Version" src="https://img.shields.io/badge/version-2.17.1-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.18.0-blue">
   <img alt="fnOS" src="https://img.shields.io/badge/fnOS-x86%20%7C%20arm64-success">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-orange">
 </p>
 
-飞牛 fnOS 系统监控应用（FPK 原生应用）：实时监控 **CPU / 内存 / 磁盘 / 网络 / 温度 / 功耗 / GPU**，支持 Docker 容器管理、端口占用、硬盘 SMART、历史趋势与七套主题。**流量统计模块**（整机 / 网卡 / 容器上下行流量、今日 / 本月累计、容器流量排行、CSV 导出）与**功耗统计模块**（实时瓦数 + kWh 耗电量 + 电费估算，无 RAPL 时自动回退 TDP 估算模型，CSV 导出）。纯 Python 标准库 + 单文件前端，**零第三方依赖、完全离线可用**，数据仅保存在本机。
+飞牛 fnOS 系统监控应用（FPK 原生应用）：实时监控 **CPU / 内存 / 磁盘 / 网络 / 温度 / 功耗 / GPU**，支持 Docker 容器管理、端口占用、硬盘 SMART、历史趋势与提醒阈值，深浅色 + 5 种主色。**流量统计模块**（整机 / 网卡 / 容器上下行流量、今日 / 本月累计、容器流量排行、CSV 导出）与**功耗统计模块**（实时瓦数 + kWh 耗电量 + 电费估算，无 RAPL 时自动回退 TDP 估算模型，CSV 导出）。纯 Python 标准库 + 单文件前端，**零第三方依赖、完全离线可用**，数据仅保存在本机。
 
-- 当前版本：**v2.17.1**
-- 作者：**Misite齊**
+- 当前版本：**v2.18.0**
+- 作者：**Misite齊**（原作）· fork 维护：**iqiuzixuan**
 - 适用平台：fnOS **x86 + arm64**（最低系统版本 0.9.0）
 - 默认端口：**8777**（安装向导可改）
 - 运行身份：**root**（需访问 sysfs 风扇转速读取、docker.sock、smartctl 与 /proc 跨用户进程信息）
 
 ## ✨ 功能
 
-- **🏠 总览仪表盘**：状态卡片（CPU / 内存 / 存储 / 网络 / 温度 / 负载 / 运行时间 / IP）、时间·农历与天气、资源详情（每核 CPU / 内存明细 / 磁盘 IO）、硬盘信息（逐盘 SMART + SATA 告警计数）、硬件与传感器（内存插槽 SPD / 温度墙 / 电压 / 风扇）、实时功耗（Intel RAPL）与显卡监控、八维历史趋势折线图、进程 TOP
-- **🐳 Docker · 端口**：容器列表与资源占用、一键启动 / 重启 / 停止、端口占用（应用 / 容器 / 系统监听）、内置应用统计（相册 / 影视 / 音乐）
-- **⚙️ 设置**：监听端口、采集间隔、历史保留天数、数据导出（CSV / JSON）、一键健康报告（HTML）
-- **🎨 界面**：七套主题、现代 NAS 仪表盘风格（侧边栏可收起）、每个面板 / 小模块独立显示隐藏、拖动排序自动记忆、手机端底部导航自适应
+- **总览**：首页一句话结论与健康分、六项核心指标（CPU / 内存 / 存储 / 网络 / 温度 / 功耗）、时间·农历与天气；NAS 机箱前面板（盘位指示灯随读写闪烁、SMART 与休眠状态一眼可辨）、核心点阵与内存条、核显、温度 / 风扇 / 电压、实时功耗与用电电费、网络与容器流量、上月汇总、进程 TOP；点击任意卡片 / 硬盘 / 容器从右侧打开详情
+- **趋势**：CPU / 内存 / 网络 / 磁盘读写 / 温度 / 功耗 / 风扇，10 分钟 ~ 30 天，所有图表悬停对齐同一时刻，越过阈值的曲线段自动标色
+- **容器**：容器列表与资源占用、启动 / 重启 / 停止（可撤销）、端口占用、内置应用统计（相册 / 影视 / 音乐）
+- **设置**：服务与采集、提醒阈值、功耗与电费、外观（深浅色 / 主色 / 点阵数字 / 字号 / 动效）、登录口令、数据目录与导出、一键健康报告、在线更新；修改即保存，可撤销
+- **界面**：点阵数字与大圆角卡片设计、编辑布局（拖动排序 / 显示隐藏）、全局搜索（/）与键盘快捷键、手机与平板自适应、跟随系统减少动态效果
 
 ## 📦 安装
 
 ### 方式一：FnDepot 应用源（推荐）
 
-在飞牛 fnOS 上安装 [FnDepot](https://github.com/EWEDLCM/FnDepot) 客户端后，添加作者的应用源即可搜索「飞牛监控」一键安装 / 升级：
+在飞牛 fnOS 上安装 [FnDepot](https://github.com/EWEDLCM/FnDepot) 客户端后，添加本仓库作为应用源，即可搜索「飞牛监控」一键安装 / 升级：
 
 ```
-https://github.com/MisiteQ/FnDepot
+https://github.com/iqiuzixuan/fnmonitor
 ```
+
+若客户端提示该源与已添加的原作者源重复，可改为添加 JSON 直链：
+
+```
+https://raw.githubusercontent.com/iqiuzixuan/fnmonitor/main/fnpack.json
+```
+
+> 本仓库 fork 自 [MisiteQ/fnmonitor](https://github.com/MisiteQ/fnmonitor)，应用源只收录本仓库发布的版本（2.18.0 起）。
 
 ### 方式二：手动安装 FPK
 
-1. 到 [Releases](https://github.com/MisiteQ/fnmonitor/releases) 按 NAS 架构下载：`fnmonitor-2.17.1-x86.fpk`（x86 机型）或 `fnmonitor-2.17.1-arm.fpk`（arm64 机型）
+1. 到 [Releases](https://github.com/iqiuzixuan/fnmonitor/releases) 按 NAS 架构下载：`fnmonitor-2.18.0-x86.fpk`（x86 机型）或 `fnmonitor-2.18.0-arm.fpk`（arm64 机型）
 2. 飞牛 OS → **应用中心** → 左下角 **手动安装** → 选择 fpk 文件
 3. 安装后从桌面打开 **飞牛监控**，或直接访问 `http://<NAS_IP>:8777`
 
@@ -54,6 +63,16 @@ https://github.com/MisiteQ/FnDepot
 # 需 Python 3
 .\build.ps1
 ```
+
+### GitHub Actions 自动发布（推荐）
+
+修改 `manifest` 的 `version` 与 `changelog` 并推送到 main 后，推送同名标签（不带 v）：
+
+```bash
+git tag 2.18.0 && git push origin 2.18.0
+```
+
+工作流 `.github/workflows/release.yml` 会用飞牛官方 fnpack 构建 x86 / arm 安装包、创建 Release，并把 SHA-256 与大小写回 `fnpack.json`，FnDepot 随即可以在线安装 / 升级。
 
 ### Linux / fnOS
 
@@ -78,6 +97,11 @@ make_icon.py            应用图标生成（不覆盖已有图标）
 
 ## 🔒 隐私与安全
 
+- **建议开启登录口令**：应用以 root 运行并可控制 Docker。未开启口令时，面板只响应 IP / localhost / 局域网主机名（`.local` `.lan` `.home` `.internal` `.localdomain` `.home.arpa`、单段主机名）访问；需要通过域名（FN Connect、DDNS、反向代理）访问时，请先在局域网内用 IP 打开面板开启口令
+- **忘记口令**：SSH 登录 NAS，编辑 `/var/apps/fnmonitor/var/config.json`，删除 `"auth_password_hash"` 一行（或把 `"auth_enabled"` 改为 0），在应用中心重启「飞牛监控」后，在局域网内用 IP 打开面板重新设置
+- **在线更新**：安装包必须通过 SHA-256 校验才会安装，不会重装同版本或降级
+- **EC 风扇读取**：部分商用机（NEC / 联想）的风扇转速需通过硬件 I/O 端口读取，默认关闭，可在 设置 → 实验性 · EC 风扇读取 中开启
+
 - 所有监控数据（实时指标、历史趋势、流量与功耗统计）均保存在 NAS 本机 SQLite 数据库，不上传任何第三方服务器
 - 纯 Python 标准库实现，**零第三方依赖、完全离线可用**，不与任何外部服务通信
 - 天气数据通过公开 API 按需获取（可在设置中关闭），不涉及个人位置信息上传
@@ -90,6 +114,7 @@ make_icon.py            应用图标生成（不覆盖已有图标）
 
 | 版本 | 内容 |
 |---|---|
+| v2.18.0 | **全新界面 + 提醒阈值 + 安全加固**：点阵数字与大圆角卡片的全新设计（首页结论与健康分、NAS 机箱前面板、核心点阵与内存条、右侧详情、编辑布局、全局搜索与快捷键、深浅色 + 5 种主色）；容量类控件负载色阶与数字联动、趋势图按数据实体配色；新增可调提醒阈值，界面与健康报告同一口径；登录口令 PBKDF2 哈希存储且不回传、登录限速、修改口令需旧口令并注销其他设备、跨站请求防护、未开启口令时禁止域名访问、在线更新强制 SHA-256 校验并拒绝降级、请求体与连接数上限、EC 风扇读取默认关闭；修复上月汇总重复累加、本月用电少算、SMART 告警计数不显示、状态快照导出与健康报告渲染失败、安装向导保存清空配置；历史 / 流量 / 报告查询走索引并库内聚合，页面 gzip 与协商缓存；更新源与应用源切换至 fork 仓库 |
 | v2.17.1 | **移除风扇控制功能**：本系统定位为纯数据读取监控，不操作系统硬件；删除风扇调速滑块、占空比设置、恢复自动温控（交还 BIOS）等所有写操作，仅保留风扇转速读取与趋势展示 |
 | v2.17.0 | ① **新增登录口令功能**：设置页可开启口令登录，访问监控面板需先输入口令；支持首次设置、修改口令、会话有效期（1-365 天），未设口令时自动引导设置；② **面板拖拽改为仅标题栏可拖**：拖拽排序不再从正文/图表区域发起，只有面板标题栏（⠿ 区域）可发起拖拽，避免误触图表交互 |
 | v2.16.8 | ① **修复更新后版本号显示为旧值（2.9.7 缓存问题）**：HTML head 添加 meta Cache-Control/Pragma/Expires 禁止缓存，更新成功后 `location.reload` 改为 cache-busting URL（`?v=时间戳`）强制浏览器从服务器获取最新页面；② **删除"一键初始化界面"描述中残留的"云纹背景"字样**；③ **修复开启上月汇总后总仪表盘不显示汇总卡片**：用户刚开启功能时 `monthly_summary` 表暂无数据（需等 cleanup 触发归档），原逻辑 `available=false` 时卡片隐藏；改为 `enabled=true` 时无论有无数据都显示，无数据时展示"暂无汇总数据，等待后台采集归档"提示 |
@@ -130,7 +155,7 @@ make_icon.py            应用图标生成（不覆盖已有图标）
 | v2.8.0 | 修复资源趋势历史数据不显示（打开即加载全部历史）；侧边栏支持收起 / 展开；界面美化 |
 | v2.7.1 | 修复小模块显示不全与平板竖屏适配 |
 
-完整日志见 [Releases](https://github.com/MisiteQ/fnmonitor/releases)。
+完整日志见 [Releases](https://github.com/iqiuzixuan/fnmonitor/releases)（2.17.1 及更早版本见原作者 [MisiteQ/fnmonitor](https://github.com/MisiteQ/fnmonitor/releases)）。
 
 ## 📄 许可证
 

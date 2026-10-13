@@ -14,9 +14,13 @@ fnMonitor - 飞牛 fnOS 系统监控后端
   python3 server.py --port 8777 --data-dir /vol1/@appdata/fnmonitor
 """
 import argparse
+import base64
 import csv
+import gzip
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import math
 import os
@@ -53,19 +57,271 @@ def _read_manifest_version():
             pass
     return ""
 
-VERSION = _read_manifest_version() or "2.17.1"   # manifest 不可读时回退（须与 manifest 同步）
-UPDATE_REPO = "MisiteQ/fnmonitor"          # GitHub 仓库：在线检查更新 / 下载安装包
+VERSION = _read_manifest_version() or "2.18.0"   # manifest 不可读时回退（须与 manifest 同步）
+UPDATE_REPO = "iqiuzixuan/fnmonitor"       # GitHub 仓库（fork）：在线检查更新 / 下载安装包
 UPDATE_CHECK_INTERVAL = 6 * 3600           # 自动更新检查周期（6 小时）
 # 下载加速：直连 GitHub 下载域在国内常不可达，失败后自动依次尝试公共加速镜像
 GH_MIRRORS = ["", "https://gh-proxy.com/", "https://ghfast.top/", "https://ghproxy.net/", "https://gh.llkk.cc/"]
-DEFAULT_CONFIG = {"interval": 10, "retention_days": 7, "port": 0, "history_interval": 60, "weather_city": "", "data_dir": "", "update_autocheck": 1, "update_autodownload": 0, "update_autoupdate": 0, "traffic_exclude_bridge": 0, "power_tdp_w": 65, "power_rate_yuan": 0.6, "power_disk_typical_w": 8, "power_nic_fixed_w": 5, "power_base_w": 8, "disk_standby_protect": 1, "open_mode": "url", "monthly_summary_enabled": 0, "auth_enabled": 0, "auth_password": "", "auth_session_days": 7}
+DEFAULT_CONFIG = {"interval": 10, "retention_days": 7, "port": 0, "history_interval": 60, "weather_city": "", "data_dir": "", "update_autocheck": 1, "update_autodownload": 0, "update_autoupdate": 0, "traffic_exclude_bridge": 0, "power_tdp_w": 65, "power_rate_yuan": 0.6, "power_disk_typical_w": 8, "power_nic_fixed_w": 5, "power_base_w": 8, "disk_standby_protect": 1, "open_mode": "url", "monthly_summary_enabled": 0, "auth_enabled": 0, "auth_password_hash": "", "auth_session_days": 7, "ec_fan_probe": 0}
+# 提醒阈值（v2.18.0 新增）：前端「设置 → 提醒阈值」写入 ui.json 的 thresholds 字段，
+# 界面着色 / 趋势阈值线 / 首页结论与健康报告共用同一口径。键 → (默认值, 最小, 最大)
+THRESHOLD_SPEC = {
+    "cpuWarn": (85, 30, 100), "cpuCrit": (95, 30, 100),
+    "memWarn": (85, 30, 100), "memCrit": (95, 30, 100),
+    "capWarn": (85, 30, 100), "capCrit": (95, 30, 100),
+    "tempWarn": (80, 40, 110), "tempCrit": (90, 40, 115),
+    "diskTempWarn": (50, 30, 80), "diskTempCrit": (58, 30, 85),
+}
+
+
+def sanitize_thresholds(raw):
+    """校验并补全阈值：非数字或越界的项回落默认值，并保证 严重 ≥ 警告。"""
+    out = {}
+    raw = raw if isinstance(raw, dict) else {}
+    for k, (dv, lo, hi) in THRESHOLD_SPEC.items():
+        try:
+            v = float(raw.get(k, dv))
+            if not math.isfinite(v):
+                raise ValueError
+            v = max(lo, min(hi, v))
+        except Exception:
+            v = float(dv)
+        out[k] = int(v) if float(v).is_integer() else round(v, 1)
+    for w, c in (("cpuWarn", "cpuCrit"), ("memWarn", "memCrit"), ("capWarn", "capCrit"),
+                 ("tempWarn", "tempCrit"), ("diskTempWarn", "diskTempCrit")):
+        if out[c] < out[w]:
+            out[c] = out[w]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 安全基础设施（v2.18.0 加固）
+# ---------------------------------------------------------------------------
+# 登录口令：config.json 只保存 PBKDF2-HMAC-SHA256 哈希（auth_password_hash，格式
+#   pbkdf2_sha256$<迭代次数>$<salt_b64>$<hash_b64>），绝不保存 / 回传明文。旧版明文
+#   auth_password 在 load_config 时自动迁移为哈希并从文件中删除。
+# 忘记口令的恢复方法（README 用）：SSH 登录 NAS，编辑
+#   /var/apps/fnmonitor/var/config.json（即 TRIM_PKGVAR/config.json），删除
+#   "auth_password_hash" 一行（或把 "auth_enabled" 改为 0），然后在应用中心重启
+#   「飞牛监控」。之后在局域网内用 IP 地址打开面板即可重新设置口令。
+SECRET_CONFIG_KEYS = ("auth_password", "auth_password_hash")
+PBKDF2_ITERATIONS = 240000
+PASSWORD_MIN_LEN = 6
+MAX_BODY_BYTES = 1024 * 1024          # POST 请求体上限（ui.json 正常只有几 KB）
+_CFG_WRITE_LOCK = threading.RLock()   # config.json 读改写串行化
+
+
+def public_config(cfg):
+    """去掉口令哈希等敏感字段后的配置副本（所有对外接口 / 导出统一使用）。"""
+    out = {k: v for k, v in (cfg or {}).items() if k not in SECRET_CONFIG_KEYS}
+    out["auth_password_set"] = bool(str((cfg or {}).get("auth_password_hash") or "").strip())
+    return out
+
+
+def hash_password(pw, iterations=PBKDF2_ITERATIONS, salt=None):
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", str(pw).encode("utf-8"), salt, int(iterations))
+    return "pbkdf2_sha256$%d$%s$%s" % (int(iterations), base64.b64encode(salt).decode("ascii"),
+                                       base64.b64encode(dk).decode("ascii"))
+
+
+def verify_password(pw, stored):
+    """恒定时间比较口令与已存哈希；格式异常一律返回 False。"""
+    try:
+        algo, iters, salt_b64, hash_b64 = str(stored or "").split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iters = int(iters)
+        if iters < 1000 or iters > 10000000:
+            return False
+        salt = base64.b64decode(salt_b64)
+        expect = base64.b64decode(hash_b64)
+        dk = hashlib.pbkdf2_hmac("sha256", str(pw).encode("utf-8"), salt, iters)
+        return hmac.compare_digest(dk, expect)
+    except Exception:
+        return False
+
+
+def write_json_secure(path, obj):
+    """原子写 JSON 文件且权限 0600：临时文件（O_CREAT 0600）→ fsync → chmod → os.replace。"""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+_CITY_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f<>\"'&`\\]")
+
+
+def clean_text(s, max_len=64):
+    """外部 / 用户字符串净化：去控制字符与 HTML 敏感字符，压缩空白，截断长度。"""
+    s = _CITY_BAD_CHARS_RE.sub("", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len]
+
+
+def parse_coords(s):
+    """'lat,lon' → (lat, lon)；格式或范围不合法返回 None。"""
+    parts = [p.strip() for p in str(s or "").split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except Exception:
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon)) or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def norm_ip(ip):
+    """'::ffff:1.2.3.4' → '1.2.3.4'；去掉 IPv6 zone。"""
+    ip = str(ip or "").split("%", 1)[0]
+    try:
+        a = ipaddress.ip_address(ip)
+        if a.version == 6 and a.ipv4_mapped:
+            return str(a.ipv4_mapped)
+        return str(a)
+    except Exception:
+        return ip
+
+
+def split_host_port(host):
+    """解析 Host 头 → (hostname 小写, port 或 None)。兼容 [v6]:port / 裸 v6。"""
+    h = str(host or "").strip().lower()
+    if not h:
+        return "", None
+    if h.startswith("["):
+        end = h.find("]")
+        if end < 0:
+            return h, None
+        name, rest = h[1:end], h[end + 1:]
+        port = rest[1:] if rest.startswith(":") else ""
+    elif h.count(":") == 1:
+        name, port = h.split(":", 1)
+    else:
+        name, port = h, ""          # 主机名或未加括号的 IPv6
+    try:
+        port = int(port) if port else None
+    except Exception:
+        port = -1
+    return name.rstrip("."), port
+
+
+# 鉴权关闭时允许的 Host（防 DNS rebinding）：IP 字面量、localhost、单标签主机名、
+# 常见局域网后缀。通过公网 / 自有域名访问前须先开启登录口令（cookie 保护后任意 Host 均可）。
+LAN_HOST_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa", ".localhost")
+
+
+def host_is_lan(host):
+    name, port = split_host_port(host)
+    if not name:
+        return True                 # HTTP/1.0 无 Host：非浏览器客户端，不存在 rebinding
+    if port == -1:
+        return False
+    try:
+        ipaddress.ip_address(name.split("%", 1)[0])
+        return True
+    except Exception:
+        pass
+    if name == "localhost" or "." not in name:
+        return True
+    return name.endswith(LAN_HOST_SUFFIXES)
+
+
+HOST_BLOCKED_HTML = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>飞牛监控 · 访问受限</title>
+<style>body{font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif;background:#f1f5f9;color:#0f172a;
+margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.c{background:#fff;border-radius:16px;padding:32px 36px;max-width:520px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h1{font-size:20px;margin:0 0 12px}p{line-height:1.7;color:#334155;margin:8px 0}code{background:#f1f5f9;padding:1px 6px;border-radius:6px}</style>
+</head><body><div class="c"><h1>通过域名访问前请先开启登录口令</h1>
+<p>为防止 DNS 重绑定等攻击，未开启登录口令时，飞牛监控只允许通过局域网 IP 地址（如 <code>http://192.168.1.10:8777</code>）、
+<code>localhost</code> 或局域网主机名访问。</p>
+<p>请先在局域网内用 IP 地址打开飞牛监控，进入「设置 → 登录口令」设置口令并开启登录保护，之后即可通过域名访问。</p>
+</div></body></html>""".encode("utf-8")
+
+
+class LoginLimiter:
+    """登录失败限速：按来源 IP 计数，10 分钟内失败 5 次锁定 60 秒，再次触发翻倍，
+    最长 15 分钟；另设全局上限（60 秒内全部来源失败 30 次 → 全局锁 30 秒），
+    防止分布式 / 多地址爆破。所有口令校验（登录、修改口令的旧口令）共用。"""
+    WINDOW = 600
+    MAX_FAILS = 5
+    BASE_LOCK = 60
+    MAX_LOCK = 900
+    GLOBAL_WINDOW = 60
+    GLOBAL_MAX = 30
+    GLOBAL_LOCK = 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ips = {}
+        self._global = []
+        self._global_until = 0.0
+        # PBKDF2 很耗 CPU：限制同时进行的校验数，避免并发请求把赛扬 CPU 打满
+        self.verify_sem = threading.BoundedSemaphore(2)
+
+    def retry_after(self, ip):
+        now = time.time()
+        with self._lock:
+            wait = 0.0
+            if self._global_until > now:
+                wait = self._global_until - now
+            st = self._ips.get(ip)
+            if st and st.get("until", 0) > now:
+                wait = max(wait, st["until"] - now)
+        return int(math.ceil(wait)) if wait > 0 else 0
+
+    def fail(self, ip):
+        now = time.time()
+        with self._lock:
+            self._global = [t for t in self._global if now - t < self.GLOBAL_WINDOW]
+            self._global.append(now)
+            if len(self._global) >= self.GLOBAL_MAX:
+                self._global_until = now + self.GLOBAL_LOCK
+                self._global = []
+            st = self._ips.setdefault(ip, {"fails": [], "until": 0.0, "level": 0, "last": now})
+            if now - st.get("last", now) > 3600:
+                st["level"] = 0        # 1 小时无失败后锁定等级复位
+            st["last"] = now
+            st["fails"] = [t for t in st["fails"] if now - t < self.WINDOW] + [now]
+            if len(st["fails"]) >= self.MAX_FAILS:
+                st["level"] += 1
+                st["until"] = now + min(self.MAX_LOCK, self.BASE_LOCK * (2 ** (st["level"] - 1)))
+                st["fails"] = []
+            if len(self._ips) > 4096:      # 内存上界：丢弃最久未活动的一半
+                for k in sorted(self._ips, key=lambda k: self._ips[k].get("last", 0))[:2048]:
+                    self._ips.pop(k, None)
+
+    def success(self, ip):
+        with self._lock:
+            self._ips.pop(ip, None)
+
+
 # 虚拟网卡前缀（Docker 网桥 / 容器 / VPN 等）：流量与功耗估算统一口径
 VIRT_IFACE_PREFIXES = ("docker", "veth", "br-", "virbr", "tun", "tap", "vnet", "lxc", "kube", "wg")
 
 # 运行期开关（采集线程按 config 刷新）：standby_protect=休眠硬盘保护，
 # 开启后容量 statvfs / SMART / 温度 / 历史库写入 / 应用目录扫描等磁盘访问
 # 对已 STANDBY 的硬盘一律跳过或走缓存，避免周期性轮询把机械硬盘唤醒
-RUNTIME = {"standby_protect": True}
+RUNTIME = {"standby_protect": True, "ec_fan_probe": False, "interval": 10}
 
 # ---------------------------------------------------------------------------
 # 基础工具
@@ -405,6 +661,10 @@ def collect_disks():
     return disks
 
 
+SMART_COUNTER_KEYS = ("reallocated_sectors", "reallocated_events", "pending_sectors",
+                      "uncorrectable", "udma_crc")
+
+
 def collect_disks_detail(prev=None):
     """按物理硬盘返回详情：名称/品牌/型号/容量/已用/使用率/温度/挂载点/休眠状态。
 
@@ -482,6 +742,10 @@ def collect_disks_detail(prev=None):
             "power_on_hours": old.get("power_on_hours", ""),
             "serial": old.get("serial", ""),
         }
+        # SMART 告警计数（ATA 属性 5/196/197/198/199）：休眠盘沿用上一次活跃时的值，
+        # 未知（NVMe / 读取失败）为 None
+        for _k in SMART_COUNTER_KEYS:
+            entry[_k] = old.get(_k)
         # SMART 健康 / 转速 / 通电时长（最多对前 8 块盘读取；休眠盘跳过，
         # smartctl -n standby 虽不唤醒盘，但此时直接复用上一次活跃值即可）
         if state != "standby" and len(result) < 8:
@@ -494,6 +758,9 @@ def collect_disks_detail(prev=None):
                 entry["rpm"] = sd.get("rpm", entry["rpm"])
                 entry["power_on_hours"] = sd.get("power_on_hours", entry["power_on_hours"])
                 entry["serial"] = sd.get("serial", entry["serial"])
+                for _k in SMART_COUNTER_KEYS:
+                    if sd.get(_k) is not None:
+                        entry[_k] = sd[_k]
                 if sd.get("temp_c") is not None and entry["temp"] is None:
                     entry["temp"] = sd["temp_c"]
         if state == "standby" and not entry["health"]:
@@ -1195,16 +1462,41 @@ def _probe_disk_power_state(name):
     return "unknown"
 
 
+_DISK_PROBE_LOCK = threading.Lock()   # 串行化探测，避免多个请求线程同时对每块盘跑 smartctl（惊群）
+
+
+def _disk_state_ttl():
+    """缓存有效期与采集间隔对齐：采集线程每个 tick 强制刷新一次（force=True），
+    请求线程在两个 tick 之间只读缓存，每块盘每个采集周期只探测一次。"""
+    try:
+        iv = float(RUNTIME.get("interval") or 10)
+    except Exception:
+        iv = 10.0
+    return max(_DISK_STATE_TTL, iv * 2 + 2)
+
+
 def disk_power_states(force=False):
-    """返回 {盘名: standby / active/idle / unknown}，8 秒缓存。
+    """返回 {盘名: standby / active/idle / unknown}，缓存见 _disk_state_ttl()。
 
     检测只使用 CHECK POWER MODE 类非唤醒命令；smartctl 与 hdparm 都不存在时
     5 分钟退避（此时返回 unknown，调用方按“非休眠”处理，保持旧行为）。"""
     global _DISK_PROBE_UNAVAILABLE_TS
     now = time.time()
+    ttl = _disk_state_ttl()
     with _DISK_STATE_LOCK:
-        if not force and _DISK_STATE_CACHE["ts"] and now - _DISK_STATE_CACHE["ts"] <= _DISK_STATE_TTL:
+        if not force and _DISK_STATE_CACHE["ts"] and now - _DISK_STATE_CACHE["ts"] <= ttl:
             return dict(_DISK_STATE_CACHE["states"])
+    with _DISK_PROBE_LOCK:
+        # 等锁期间可能已有其他线程刚完成探测：直接复用（force 时只复用 1 秒内的结果）
+        with _DISK_STATE_LOCK:
+            age = time.time() - _DISK_STATE_CACHE["ts"] if _DISK_STATE_CACHE["ts"] else 1e9
+            if age <= (1.0 if force else ttl):
+                return dict(_DISK_STATE_CACHE["states"])
+        return _probe_all_disk_states(now)
+
+
+def _probe_all_disk_states(now):
+    global _DISK_PROBE_UNAVAILABLE_TS
     states = {}
     if is_linux() and now - _DISK_PROBE_UNAVAILABLE_TS > 300:
         for name in _whole_disks():
@@ -1327,8 +1619,20 @@ def parse_docker_netio(s):
 
 
 # ===================== GPU 实时监控（网络主流硬件监控面板功能） =====================
+_GPU_IDENT_CACHE = {"ts": 0.0, "list": None}
+
+
 def _gpu_ident_list():
-    """lspci 识别显卡设备：vendor/type/name/pci。"""
+    """lspci 识别显卡设备（硬件列表运行期不变：缓存 1 小时，避免每 10 秒跑一次 lspci）。"""
+    now = time.time()
+    if _GPU_IDENT_CACHE["list"] is not None and now - _GPU_IDENT_CACHE["ts"] < 3600:
+        return [dict(x) for x in _GPU_IDENT_CACHE["list"]]
+    idents = _gpu_ident_list_uncached()
+    _GPU_IDENT_CACHE.update(ts=now, list=[dict(x) for x in idents])
+    return idents
+
+
+def _gpu_ident_list_uncached():
     idents = []
     out, rc = run_cmd(["lspci", "-nn"], timeout=10)
     if rc != 0:
@@ -1747,13 +2051,15 @@ def collect_sensors():
                             "rpm": int(sf.get("rpm") or 0)})
     if len(merged_fans) > n_hw:
         fan_src.append("hwmon")
-    # ---- 标准 hwmon / sensors 均无风扇时，启用只读补充数据源（自动识别）----
-    # 覆盖标准内核驱动未接管的机型：IPMI/BMC 服务器、ThinkPad ACPI、EC 硬件
-    # 监控邮箱（0xA20，机型无关：端口存在+PnP 占用+温度应答三重硬件闸口）。只读。
+    # ---- 标准 hwmon / sensors 均无风扇时，启用补充数据源（自动识别）----
+    # 覆盖标准内核驱动未接管的机型：IPMI/BMC 服务器、ThinkPad ACPI（均为只读）。
+    # EC 硬件监控邮箱（0xA20）需要向 IO 端口 0xA20/0xA21 写入选通 / bank / 寄存器
+    # 字节，属于硬件访问，默认关闭；仅在用户于设置中开启 ec_fan_probe 后才尝试。
     if not merged_fans:
-        for tag, getter in (("ipmi", _ipmi_fans),
-                            ("ibm-acpi", _ibm_acpi_fans),
-                            ("ec-hwm", _ec_hwm_fans)):
+        sources = [("ipmi", _ipmi_fans), ("ibm-acpi", _ibm_acpi_fans)]
+        if RUNTIME.get("ec_fan_probe"):
+            sources.append(("ec-hwm", _ec_hwm_fans))
+        for tag, getter in sources:
             try:
                 extra = getter()
             except Exception:
@@ -1941,9 +2247,14 @@ def _ec_hwm_fans():
     GFAN/HWMG 方法：选 bank1 后，寄存器 0x40-0x47 为 4 个风扇的 16 位转速
     （RPM，高字节在前）。为保证对无关品牌主机零风险，启用需依次通过：
     端口区存在 → PnP 固件占用 → 温度应答合法（见上述两个闸口函数），且
-    数据端口 0xA22 全程只做 IN 读、绝不写入；首末各写一次 0xFF 是固件自身
-    的邮箱选通复位，使邮箱回到空闲态。验证失败的主机结果缓存，不再访问。
+    数据端口 0xA22 全程只做 IN 读；但每次读取都要向 0xA20/0xA21 **写入**选通复位、
+    bank 与寄存器号（首末各写一次 0xFF 是固件自身的邮箱选通复位）。这不是纯只读
+    操作，且与固件（ACPI/SMM）并发访问同一邮箱时没有互斥，因此默认关闭，仅在
+    config.ec_fan_probe=1（设置页「实验性：EC 风扇读取」）时由 collect_sensors 调用。
+    验证失败的主机结果缓存，不再访问。
     """
+    if not RUNTIME.get("ec_fan_probe"):
+        return []
     fans = []
     if _EC_HWM_STATE["checked"] and not _EC_HWM_STATE["valid"]:
         return fans
@@ -2687,15 +2998,16 @@ def fetch_weather(city_override=None):
         # ---- 定位：自定义位置 优先 ----
         lat = lon = None
         city = ""
-        override = (city_override or "").strip()
+        override = clean_text(city_override or "", 64)
         if override:
             if "," in override:
-                parts = [p.strip() for p in override.split(",")]
-                try:
-                    lat, lon = float(parts[0]), float(parts[1])
-                    city = override
-                except Exception:
+                # 坐标模式：只接受「纬度,经度」两段数字，显示名为规范化后的坐标串
+                # （绝不回显原始输入，防止存储型 XSS）
+                ll = parse_coords(override)
+                if not ll:
                     return {"ok": False, "error": "坐标格式应为 纬度,经度（如 34.26,117.18）"}
+                lat, lon = ll
+                city = "%.4f,%.4f" % (lat, lon)
             else:
                 # 城市名 → 内置中国城市库本地检索（准确，秒出）；未命中再走 Open-Meteo（国际/拼音）
                 hit = _cn_city_lookup(override)
@@ -2708,20 +3020,34 @@ def fetch_weather(city_override=None):
                         rs = (geo or {}).get("results") or []
                         if rs:
                             lat, lon = float(rs[0]["latitude"]), float(rs[0]["longitude"])
-                            city = rs[0].get("name") or override
+                            city = clean_text(rs[0].get("name") or override, 64)
                     except Exception:
                         pass
                 if lat is None:
                     return {"ok": False, "error": "未找到城市「%s」，可改用 纬度,经度 格式" % override}
         else:
-            # 公网 IP 定位（ip-api.com 免费版，仅位置信息）
+            # 公网 IP 定位：优先 HTTPS 的 ipwho.is；失败再回退 ip-api.com（免费版仅支持
+            # 明文 HTTP，返回的地名一律经 clean_text 净化后才使用）
             try:
-                loc = _get("http://ip-api.com/json/?lang=zh-CN&fields=lat,lon,city,regionName,country", timeout=6)
-                if loc and loc.get("lat") is not None and loc.get("lon") is not None:
-                    lat, lon = float(loc["lat"]), float(loc["lon"])
-                    city = loc.get("city") or loc.get("regionName") or loc.get("country") or "未知地区"
+                loc = _get("https://ipwho.is/?lang=zh-CN&fields=success,latitude,longitude,city,region,country",
+                           timeout=6)
+                if loc and loc.get("success") is not False and loc.get("latitude") is not None \
+                        and loc.get("longitude") is not None:
+                    lat, lon = float(loc["latitude"]), float(loc["longitude"])
+                    city = loc.get("city") or loc.get("region") or loc.get("country") or ""
             except Exception:
                 pass
+            if lat is None:
+                try:
+                    loc = _get("http://ip-api.com/json/?lang=zh-CN&fields=lat,lon,city,regionName,country", timeout=6)
+                    if loc and loc.get("lat") is not None and loc.get("lon") is not None:
+                        lat, lon = float(loc["lat"]), float(loc["lon"])
+                        city = loc.get("city") or loc.get("regionName") or loc.get("country") or ""
+                except Exception:
+                    pass
+            if lat is not None and not parse_coords("%s,%s" % (lat, lon)):
+                lat = lon = None
+            city = clean_text(city, 64) or "未知地区"
             if lat is None:
                 return {"ok": False, "error": "无法定位当前网络位置"}
         # ---- Open-Meteo 当前天气 ----
@@ -2734,7 +3060,7 @@ def fetch_weather(city_override=None):
         temp = cur.get("temperature_2m")
         if temp is None:
             return {"ok": False, "error": "天气接口无数据"}
-        return {"ok": True, "city": city or override or "未知地区",
+        return {"ok": True, "city": clean_text(city or override, 64) or "未知地区",
                 "temp": round(float(temp), 1),
                 "feels": round(float(cur.get("apparent_temperature") or temp), 1),
                 "humidity": round(float(cur.get("relative_humidity_2m") or 0), 1),
@@ -3167,6 +3493,7 @@ class History:
         # 数据盘休眠期间读记忆（key -> 上次活跃时读到的行），避免前端面板轮询
         # 触发的 SELECT 把已 STANDBY 的机械硬盘唤醒
         self._read_memo = {}
+        self._memo_lock = threading.Lock()
         self._init()
 
     def _asleep(self):
@@ -3184,12 +3511,13 @@ class History:
         用户主动的导出 / 报告 / 统计操作不应调用本方法——其结果可能含数百万行，
         挂入 _read_memo 会长期占用数 GB 内存且永不释放（参见 issue #3）。
         """
-        if rows is None:
-            return self._read_memo.get(key, [])
-        self._read_memo[key] = rows
-        if len(self._read_memo) > 128:
-            for k in list(self._read_memo)[:32]:
-                self._read_memo.pop(k, None)
+        with self._memo_lock:
+            if rows is None:
+                return self._read_memo.get(key, [])
+            self._read_memo[key] = rows
+            if len(self._read_memo) > 128:
+                for k in list(self._read_memo)[:32]:
+                    self._read_memo.pop(k, None)
         return rows
 
     def _no_cache(self, rows):
@@ -3216,6 +3544,8 @@ class History:
                     first_ts REAL, last_ts REAL, updated_at REAL,
                     PRIMARY KEY (year, month, metric))""")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_ms_ym ON monthly_summary(year DESC, month DESC)")
+                # 元数据（月度归档水位线等）
+                conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
                 # 自愈：v2.8.0 前的历史写入曾把 (指标名, 时间戳) 两列互换（ts 列存了文本），
                 # 这些脏行永远查不出来还会拖慢查询，启动时一次性清除
                 conn.execute("DELETE FROM metrics WHERE typeof(ts) != 'real'")
@@ -3229,7 +3559,7 @@ class History:
         if not rows:
             return
         try:
-            conn = sqlite3.connect(self.db_path, timeout=15)
+            conn = self._connect(write=True)
             try:
                 conn.executemany("INSERT INTO metrics(ts, metric, value) VALUES(?,?,?)", rows)
                 conn.commit()
@@ -3261,64 +3591,203 @@ class History:
             return []
         return self._memo(key, rows)
 
-    def export_net(self, seconds):
-        """导出网卡上下行历史 (ts, metric, value)。seconds=0 表示全部。
-
-        导出路径不挂入 _read_memo 缓存（issue #3）：全表结果可达数百万行，
-        缓存会长期占用数 GB 内存且永不释放。休眠保护仍生效，休眠时返回空列表。
-        """
-        if self._asleep():
-            return []
-        # 全表查询加 LIMIT 保护，防止极端积累（约 23 个月 × 每分钟 1 条）撑爆内存
-        limit = "" if seconds else " LIMIT 1000000"
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=15)
+    def _connect(self, write=False):
+        conn = sqlite3.connect(self.db_path, timeout=15)
+        if write:
+            # WAL 下 synchronous=NORMAL：断电最多丢最后一个事务（监控数据可接受），
+            # 显著减少 fsync，对机械硬盘更友好；限制 WAL 文件残留大小
             try:
-                if seconds:
-                    cutoff = time.time() - seconds
-                    rows = conn.execute(
-                        "SELECT ts, metric, value FROM metrics WHERE ts>=? "
-                        "AND (metric LIKE 'net_rx:%' OR metric LIKE 'net_tx:%') ORDER BY ts"
-                        + limit,
-                        (cutoff,),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT ts, metric, value FROM metrics "
-                        "WHERE (metric LIKE 'net_rx:%' OR metric LIKE 'net_tx:%') ORDER BY ts"
-                        + limit,
-                    ).fetchall()
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA journal_size_limit=67108864")
+            except Exception:
+                pass
+        return conn
+
+    @staticmethod
+    def _prefix_hi(prefix):
+        """前缀范围查询上界：'net_rx:' → 'net_rx;'。metric >= prefix AND metric < hi 可走
+        idx_metric_ts 索引（LIKE 默认大小写不敏感，与 BINARY 索引不匹配，会全表扫描）。"""
+        return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+    def _distinct_metrics(self, conn, prefix=""):
+        """松散索引扫描（loose index scan）：每个不同的 metric 只做一次索引 seek，
+        代价与指标个数成正比，与行数无关（替代 SELECT DISTINCT 全量扫描）。"""
+        out = []
+        hi = self._prefix_hi(prefix) if prefix else None
+        cur = conn.execute(
+            "SELECT metric FROM metrics WHERE metric >= ?" + (" AND metric < ?" if hi else "")
+            + " ORDER BY metric LIMIT 1", (prefix, hi) if hi else (prefix,)).fetchone()
+        while cur and len(out) < 100000:
+            out.append(cur[0])
+            cur = conn.execute(
+                "SELECT metric FROM metrics WHERE metric > ?" + (" AND metric < ?" if hi else "")
+                + " ORDER BY metric LIMIT 1", (cur[0], hi) if hi else (cur[0],)).fetchone()
+        return out
+
+    def metrics_with_prefix(self, prefix):
+        """返回库中以 prefix 开头的全部指标名（面板轮询用：休眠时返回上次结果）。"""
+        key = ("mp", prefix)
+        if self._asleep():
+            return self._memo(key, None)
+        try:
+            conn = self._connect()
+            try:
+                rows = self._distinct_metrics(conn, prefix)
             finally:
                 conn.close()
         except Exception:
             return []
-        return self._no_cache(rows)
+        return self._memo(key, rows)
 
-    def export_rows(self, seconds):
-        """导出全部历史记录 (ts, metric, value)；seconds=0 表示全部。
+    @staticmethod
+    def _real_span(conn, metrics, seconds, span=None):
+        """降采样桶宽所用的时间跨度：固定范围直接用 seconds；「全部」用实际最早数据
+        （每个指标一次索引 MIN 查询），避免保留期很长但数据很少时点数过稀。"""
+        if seconds:
+            return float(seconds)
+        first = None
+        for m in metrics[:500]:
+            r = conn.execute("SELECT MIN(ts) FROM metrics WHERE metric=?", (m,)).fetchone()
+            if r and r[0] is not None and (first is None or r[0] < first):
+                first = r[0]
+        if first is None:
+            return float(span or 86400)
+        return max(60.0, time.time() - first)
 
-        导出路径不挂入 _read_memo 缓存（issue #3）：全表结果可达数百万行，
-        缓存会长期占用数 GB 内存且永不释放。休眠保护仍生效，休眠时返回空列表。
-        """
+    def query_series(self, metric, seconds, span=None, max_points=720):
+        """单指标趋势：按时间桶在 SQL 内求平均，最多返回约 max_points 个点。
+        数据点少于 max_points 时每个桶只含一个采样，结果与原始数据完全一致。"""
+        key = ("qs", metric, seconds)
+        if self._asleep():
+            return self._memo(key, None)
+        cutoff = (time.time() - seconds) if seconds else 0
+        try:
+            conn = self._connect()
+            try:
+                bucket = max(1.0, self._real_span(conn, [metric], seconds, span) / max_points)
+                rows = conn.execute(
+                    "SELECT MAX(ts), AVG(value) FROM metrics WHERE metric=? AND ts>=? "
+                    "GROUP BY CAST(ts / ? AS INTEGER) ORDER BY 1",
+                    (metric, cutoff, bucket)).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return self._memo(key, rows)
+
+    def bucket_for(self, metrics, seconds, max_points=720):
+        """多条序列共用的桶宽（保证 rx/tx 等成对序列时间戳对齐）。"""
+        if seconds:
+            return max(1.0, float(seconds) / max_points)
+        if self._asleep():
+            return None
+        try:
+            conn = self._connect()
+            try:
+                return max(1.0, self._real_span(conn, list(metrics), 0) / max_points)
+            finally:
+                conn.close()
+        except Exception:
+            return None
+
+    def sum_series(self, metrics, seconds, span=None, max_points=720, bucket=None):
+        """多指标「同一时刻求和」后按时间桶平均（网卡 / 磁盘 / 容器聚合曲线）。
+        返回 [(ts, value)]；每桶的值 = 桶内各时刻总和的平均。"""
+        metrics = list(metrics or [])
+        if not metrics:
+            return []
+        key = ("ss", tuple(metrics), seconds)
+        if self._asleep():
+            return self._memo(key, None)
+        cutoff = (time.time() - seconds) if seconds else 0
+        out = []
+        try:
+            conn = self._connect()
+            try:
+                if not bucket:
+                    bucket = max(1.0, self._real_span(conn, metrics, seconds, span) / max_points)
+                # IN 列表分批（SQLite 变量上限 999），各批结果按桶合并
+                acc = {}
+                for i in range(0, len(metrics), 500):
+                    part = metrics[i:i + 500]
+                    q = ("SELECT CAST(ts / ? AS INTEGER) AS b, MAX(ts), SUM(value), COUNT(DISTINCT ts) "
+                         "FROM metrics WHERE metric IN (%s) AND ts>=? GROUP BY b" % ",".join("?" * len(part)))
+                    for b, t, sv, n in conn.execute(q, [bucket] + part + [cutoff]):
+                        a = acc.setdefault(b, [t, 0.0, 0])
+                        a[0] = max(a[0], t)
+                        a[1] += sv or 0.0
+                        a[2] = max(a[2], n or 0)
+                for b in sorted(acc):
+                    t, sv, n = acc[b]
+                    out.append((t, sv / n if n else 0.0))
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return self._memo(key, out)
+
+    def first_last(self, metric, cutoff):
+        """区间内首条与末条值（两次索引 seek）。无数据返回 None。"""
+        if self._asleep():
+            return self._memo(("fl", metric, int(cutoff / 60)), None) or None
+        try:
+            conn = self._connect()
+            try:
+                a = conn.execute("SELECT value FROM metrics WHERE metric=? AND ts>=? ORDER BY ts ASC LIMIT 1",
+                                 (metric, cutoff)).fetchone()
+                b = conn.execute("SELECT value FROM metrics WHERE metric=? AND ts>=? ORDER BY ts DESC LIMIT 1",
+                                 (metric, cutoff)).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        res = (a[0], b[0]) if a and b else None
+        if res:
+            self._memo(("fl", metric, int(cutoff / 60)), res)
+        return res
+
+    def energy_kwh(self, metric, seconds, default_dt=60):
+        """区间能耗：SUM(功率) × 采样间隔中位数（SQL 聚合覆盖完整区间，不受行数上限截断）。"""
+        key = ("kwh", metric, int((time.time() - seconds) / 60))
+        if self._asleep():
+            v = self._memo(key, None)
+            return v if isinstance(v, float) else 0.0
+        cutoff = time.time() - seconds
+        try:
+            conn = self._connect()
+            try:
+                s, n = conn.execute("SELECT SUM(value), COUNT(value) FROM metrics WHERE metric=? AND ts>=?",
+                                    (metric, cutoff)).fetchone()
+                if not n:
+                    return 0.0
+                if n < 2:
+                    return round((s or 0) * default_dt / 3600000.0, 4)
+                ts = [r[0] for r in conn.execute(
+                    "SELECT ts FROM metrics WHERE metric=? AND ts>=? ORDER BY ts DESC LIMIT 2000",
+                    (metric, cutoff))]
+            finally:
+                conn.close()
+        except Exception:
+            return 0.0
+        dts = sorted(ts[i] - ts[i + 1] for i in range(len(ts) - 1))
+        median_dt = dts[len(dts) // 2] if dts else default_dt
+        val = round((s or 0) * median_dt / 3600000.0, 4)
+        self._memo(key, val)
+        return val
+
+    def export_net(self, seconds):
+        """导出网卡上下行历史 (ts, metric, value)。seconds=0 表示全部（走索引范围条件）。"""
         if self._asleep():
             return []
-        # 全表查询加 LIMIT 保护，防止极端积累（约 23 个月 × 每分钟 1 条）撑爆内存
         limit = "" if seconds else " LIMIT 1000000"
+        cutoff = (time.time() - seconds) if seconds else 0
         try:
-            conn = sqlite3.connect(self.db_path, timeout=15)
+            conn = self._connect()
             try:
-                if seconds:
-                    cutoff = time.time() - seconds
-                    rows = conn.execute(
-                        "SELECT ts, metric, value FROM metrics WHERE ts>=? ORDER BY ts"
-                        + limit,
-                        (cutoff,),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT ts, metric, value FROM metrics ORDER BY ts"
-                        + limit,
-                    ).fetchall()
+                rows = conn.execute(
+                    "SELECT ts, metric, value FROM metrics WHERE ts>=? AND "
+                    "((metric >= 'net_rx:' AND metric < 'net_rx;') OR (metric >= 'net_tx:' AND metric < 'net_tx;')) "
+                    "ORDER BY ts" + limit, (cutoff,)).fetchall()
             finally:
                 conn.close()
         except Exception:
@@ -3326,155 +3795,229 @@ class History:
         return self._no_cache(rows)
 
     def query_prefix(self, prefix, seconds):
-        """按前缀批量查询历史指标（如 'net_rx_bytes:' 返回所有网卡的累计字节历史）。
-        seconds=0 表示全部保留期。返回 [(ts, metric, value)] 列表。
-
-        导出 / 统计路径不挂入 _read_memo 缓存（issue #3）：全前缀结果可达数百万行，
-        缓存会长期占用数 GB 内存且永不释放。休眠保护仍生效，休眠时返回空列表。
-        """
+        """按前缀批量查询历史指标，返回 [(ts, metric, value)]（索引范围条件，非 LIKE）。"""
         if self._asleep():
             return []
         cutoff = (time.time() - seconds) if seconds else 0
-        # 全表查询加 LIMIT 保护，防止极端积累撑爆内存
         limit = "" if seconds else " LIMIT 1000000"
         try:
-            conn = sqlite3.connect(self.db_path, timeout=15)
+            conn = self._connect()
             try:
-                cur = conn.execute(
-                    "SELECT ts, metric, value FROM metrics WHERE metric LIKE ? AND ts>=? ORDER BY ts"
-                    + limit,
-                    (prefix + "%", cutoff),
-                )
-                rows = cur.fetchall()
+                rows = conn.execute(
+                    "SELECT ts, metric, value FROM metrics WHERE metric >= ? AND metric < ? AND ts>=? ORDER BY ts"
+                    + limit, (prefix, self._prefix_hi(prefix), cutoff)).fetchall()
             finally:
                 conn.close()
         except Exception:
             return []
         return self._no_cache(rows)
 
-    def _archive_to_monthly(self, cutoff):
-        """把即将被 cleanup 删除的 metrics 数据（ts < cutoff）按月汇总后 UPSERT 到 monthly_summary。
-
-        叠加策略（INSERT ON CONFLICT）：
-        - sum_val += new_sum, count_val += new_count（用于加权平均 avg = sum/count）
-        - max_val = MAX(max_val, new_max), min_val = MIN(min_val, new_min)
-        - first_val/first_ts 取更早的；last_val/last_ts 取更晚的
-        - 累计型指标（net_rx_bytes 等）月度值 = last_val - first_val
-        """
-        import datetime
-        conn = sqlite3.connect(self.db_path, timeout=15)
+    def export_columns(self, seconds, prefixes=None):
+        """导出宽表的列：区间内出现过的指标，按首次出现顺序（ts, rowid）排列，
+        与旧实现「按行出现顺序」一致。prefixes 给定时按前缀分组依次排列。"""
+        if self._asleep():
+            return []
+        cutoff = (time.time() - seconds) if seconds else 0
+        cols = []
         try:
-            rows = conn.execute(
-                "SELECT metric, SUM(value), COUNT(value), MAX(value), MIN(value) "
-                "FROM metrics WHERE ts < ? GROUP BY metric", (cutoff,)
-            ).fetchall()
-            if not rows:
-                return
-            now = time.time()
-            for metric, s, cnt, mx, mn in rows:
-                first_row = conn.execute(
-                    "SELECT ts, value FROM metrics WHERE metric=? AND ts<? ORDER BY ts ASC LIMIT 1",
-                    (metric, cutoff)
-                ).fetchone()
-                last_row = conn.execute(
-                    "SELECT ts, value FROM metrics WHERE metric=? AND ts<? ORDER BY ts DESC LIMIT 1",
-                    (metric, cutoff)
-                ).fetchone()
-                if not first_row:
-                    continue
-                dt = datetime.datetime.fromtimestamp(first_row[0])
-                y, m = dt.year, dt.month
-                conn.execute("""
-                    INSERT INTO monthly_summary(year, month, metric, sum_val, count_val, max_val, min_val,
-                        first_val, last_val, first_ts, last_ts, updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(year, month, metric) DO UPDATE SET
-                        sum_val = monthly_summary.sum_val + excluded.sum_val,
-                        count_val = monthly_summary.count_val + excluded.count_val,
-                        max_val = MAX(monthly_summary.max_val, excluded.max_val),
-                        min_val = MIN(monthly_summary.min_val, excluded.min_val),
-                        first_val = CASE WHEN excluded.first_ts < monthly_summary.first_ts
-                                    THEN excluded.first_val ELSE monthly_summary.first_val END,
-                        first_ts = MIN(monthly_summary.first_ts, excluded.first_ts),
-                        last_val = CASE WHEN excluded.last_ts > monthly_summary.last_ts
-                                   THEN excluded.last_val ELSE monthly_summary.last_val END,
-                        last_ts = MAX(monthly_summary.last_ts, excluded.last_ts),
-                        updated_at = excluded.updated_at
-                """, (y, m, metric, s or 0, cnt, mx, mn,
-                      first_row[1], last_row[1], first_row[0], last_row[0], now))
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    def _archive_to_monthly_range(self, start_ts, end_ts):
-        """把 metrics 表中指定时间范围 [start_ts, end_ts) 的数据按月汇总后 UPSERT 到 monthly_summary。
-
-        用于月初补全：月末最后几天的数据可能还没被 cleanup 删除，但月初时需要归档到 monthly_summary，
-        确保上月汇总完整（与 _archive_to_monthly 的叠加策略相同）。
-        """
-        import datetime
-        conn = sqlite3.connect(self.db_path, timeout=15)
-        try:
-            rows = conn.execute(
-                "SELECT metric, SUM(value), COUNT(value), MAX(value), MIN(value) "
-                "FROM metrics WHERE ts >= ? AND ts < ? GROUP BY metric", (start_ts, end_ts)
-            ).fetchall()
-            if not rows:
-                return
-            now = time.time()
-            for metric, s, cnt, mx, mn in rows:
-                first_row = conn.execute(
-                    "SELECT ts, value FROM metrics WHERE metric=? AND ts>=? AND ts<? ORDER BY ts ASC LIMIT 1",
-                    (metric, start_ts, end_ts)
-                ).fetchone()
-                last_row = conn.execute(
-                    "SELECT ts, value FROM metrics WHERE metric=? AND ts>=? AND ts<? ORDER BY ts DESC LIMIT 1",
-                    (metric, start_ts, end_ts)
-                ).fetchone()
-                if not first_row:
-                    continue
-                dt = datetime.datetime.fromtimestamp(first_row[0])
-                y, m = dt.year, dt.month
-                conn.execute("""
-                    INSERT INTO monthly_summary(year, month, metric, sum_val, count_val, max_val, min_val,
-                        first_val, last_val, first_ts, last_ts, updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(year, month, metric) DO UPDATE SET
-                        sum_val = monthly_summary.sum_val + excluded.sum_val,
-                        count_val = monthly_summary.count_val + excluded.count_val,
-                        max_val = MAX(monthly_summary.max_val, excluded.max_val),
-                        min_val = MIN(monthly_summary.min_val, excluded.min_val),
-                        first_val = CASE WHEN excluded.first_ts < monthly_summary.first_ts
-                                    THEN excluded.first_val ELSE monthly_summary.first_val END,
-                        first_ts = MIN(monthly_summary.first_ts, excluded.first_ts),
-                        last_val = CASE WHEN excluded.last_ts > monthly_summary.last_ts
-                                   THEN excluded.last_val ELSE monthly_summary.last_val END,
-                        last_ts = MAX(monthly_summary.last_ts, excluded.last_ts),
-                        updated_at = excluded.updated_at
-                """, (y, m, metric, s or 0, cnt, mx, mn,
-                      first_row[1], last_row[1], first_row[0], last_row[0], now))
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    def cleanup(self, retention_days, archive_enabled=False):
-        cutoff = time.time() - retention_days * 86400
-        # 开启上月汇总时，删除前先把即将清理的数据按月汇总叠加保存（issue #3 邻近思路）
-        if archive_enabled:
+            conn = self._connect()
             try:
-                self._archive_to_monthly(cutoff)
+                for pf in (prefixes or [""]):
+                    found = []
+                    for m in self._distinct_metrics(conn, pf):
+                        r = conn.execute("SELECT ts, rowid FROM metrics WHERE metric=? AND ts>=? "
+                                         "ORDER BY ts LIMIT 1", (m, cutoff)).fetchone()
+                        if r:
+                            found.append((r[0], r[1], m))
+                    cols.extend(m for _, _, m in sorted(found))
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return cols
+
+    def iter_rows(self, seconds, prefixes=None, metrics=None):
+        """流式遍历 (ts, metric, value)（按 ts 排序），不一次性 fetchall 到内存。"""
+        if self._asleep():
+            return
+        cutoff = (time.time() - seconds) if seconds else 0
+        where, args = ["ts>=?"], [cutoff]
+        if prefixes:
+            where.append("(" + " OR ".join("(metric >= ? AND metric < ?)" for _ in prefixes) + ")")
+            for pf in prefixes:
+                args += [pf, self._prefix_hi(pf)]
+        if metrics:
+            where.append("metric IN (%s)" % ",".join("?" * len(metrics)))
+            args += list(metrics)
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT ts, metric, value FROM metrics WHERE %s ORDER BY ts" % " AND ".join(where), args)
+            while True:
+                chunk = cur.fetchmany(5000)
+                if not chunk:
+                    break
+                for r in chunk:
+                    yield r
+        finally:
+            conn.close()
+
+    def report_stats(self, seconds):
+        """健康报告统计：每指标 last/max/sum/n 在 SQL 内聚合（不物化数百万行）。"""
+        if self._asleep():
+            return {}
+        cutoff = time.time() - seconds
+        out = {}
+        try:
+            conn = self._connect()
+            try:
+                for m in self._distinct_metrics(conn):
+                    r = conn.execute(
+                        "SELECT MAX(value), SUM(value), COUNT(value) FROM metrics "
+                        "WHERE metric=? AND ts>=? AND value BETWEEN -1e308 AND 1e308", (m, cutoff)).fetchone()
+                    if not r or not r[2]:
+                        continue
+                    last = conn.execute(
+                        "SELECT value FROM metrics WHERE metric=? AND ts>=? AND value BETWEEN -1e308 AND 1e308 "
+                        "ORDER BY ts DESC LIMIT 1", (m, cutoff)).fetchone()
+                    out[m] = {"last": last[0] if last else r[0], "max": r[0], "sum": r[1] or 0.0, "n": r[2]}
+            finally:
+                conn.close()
+        except Exception:
+            traceback.print_exc()
+        return out
+
+    def diag(self):
+        """趋势诊断信息（休眠时不读库）。"""
+        info = {}
+        if self._asleep():
+            info["asleep"] = True
+            return info
+        conn = self._connect()
+        try:
+            metrics = self._distinct_metrics(conn)
+            info["metrics"] = len(metrics)
+            last = None
+            for m in metrics:
+                r = conn.execute("SELECT MAX(ts) FROM metrics WHERE metric=?", (m,)).fetchone()
+                if r and r[0] and (last is None or r[0] > last):
+                    last = r[0]
+            info["last_ts"] = last
+            info["rows"] = conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
+        finally:
+            conn.close()
+        return info
+
+    def monthly_rows(self):
+        """读取月度汇总：优先上一个自然月，没有则取最近一个月。返回 (y, m, rows) 或 None。"""
+        key = ("monthly",)
+        if self._asleep():
+            return self._memo(key, None) or None
+        import datetime
+        today = datetime.date.today()
+        py, pm = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT year, month FROM monthly_summary WHERE year=? AND month=? LIMIT 1",
+                               (py, pm)).fetchone()
+            if not row:
+                row = conn.execute("SELECT year, month FROM monthly_summary "
+                                   "ORDER BY year DESC, month DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            y, m = row
+            rows = conn.execute(
+                "SELECT metric, sum_val, count_val, max_val, min_val, first_val, last_val "
+                "FROM monthly_summary WHERE year=? AND month=?", (y, m)).fetchall()
+        finally:
+            conn.close()
+        res = (y, m, rows)
+        self._memo(key, res)
+        return res
+
+    # ---- 月度汇总归档（水位线，杜绝重复累加） ----
+    # meta.monthly_archived_until = W 表示 ts < W 的数据都已累加进 monthly_summary。
+    # 每次只归档 [W, target) 并在同一事务内推进 W，cleanup 与月初补全共用，
+    # 任何数据只会被计入一次（修复旧版月初 1-3 日各累加一次 + cleanup 再加一次）。
+    _UPSERT_MONTHLY = """
+        INSERT INTO monthly_summary(year, month, metric, sum_val, count_val, max_val, min_val,
+            first_val, last_val, first_ts, last_ts, updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(year, month, metric) DO UPDATE SET
+            sum_val = monthly_summary.sum_val + excluded.sum_val,
+            count_val = monthly_summary.count_val + excluded.count_val,
+            max_val = MAX(monthly_summary.max_val, excluded.max_val),
+            min_val = MIN(monthly_summary.min_val, excluded.min_val),
+            first_val = CASE WHEN excluded.first_ts < monthly_summary.first_ts
+                        THEN excluded.first_val ELSE monthly_summary.first_val END,
+            first_ts = MIN(monthly_summary.first_ts, excluded.first_ts),
+            last_val = CASE WHEN excluded.last_ts > monthly_summary.last_ts
+                       THEN excluded.last_val ELSE monthly_summary.last_val END,
+            last_ts = MAX(monthly_summary.last_ts, excluded.last_ts),
+            updated_at = excluded.updated_at
+    """
+
+    def _archive_watermark(self, conn):
+        r = conn.execute("SELECT value FROM meta WHERE key='monthly_archived_until'").fetchone()
+        if r:
+            try:
+                return float(r[0])
             except Exception:
                 pass
-        conn = sqlite3.connect(self.db_path, timeout=15)
+        # 首次（或从旧版升级）：旧版已归档的数据以 monthly_summary 中最大的 last_ts 为界，
+        # 界线之前仍在 metrics 中的行视为已归档，避免升级后再累加一次
+        r = conn.execute("SELECT MAX(last_ts) FROM monthly_summary").fetchone()
+        return (float(r[0]) + 1e-3) if r and r[0] else 0.0
+
+    def _archive_until(self, conn, target):
+        wm = self._archive_watermark(conn)
+        if target <= wm:
+            return 0
+        now = time.time()
+        n = 0
+        for metric in self._distinct_metrics(conn):
+            groups = conn.execute(
+                "SELECT CAST(strftime('%Y', ts, 'unixepoch', 'localtime') AS INTEGER), "
+                "CAST(strftime('%m', ts, 'unixepoch', 'localtime') AS INTEGER), "
+                "SUM(value), COUNT(value), MAX(value), MIN(value), MIN(ts), MAX(ts) "
+                "FROM metrics WHERE metric=? AND ts>=? AND ts<? GROUP BY 1, 2",
+                (metric, wm, target)).fetchall()
+            for y, m, s, cnt, mx, mn, fts, lts in groups:
+                if not cnt:
+                    continue
+                fv = conn.execute("SELECT value FROM metrics WHERE metric=? AND ts=? LIMIT 1", (metric, fts)).fetchone()
+                lv = conn.execute("SELECT value FROM metrics WHERE metric=? AND ts=? LIMIT 1", (metric, lts)).fetchone()
+                conn.execute(self._UPSERT_MONTHLY, (y, m, metric, s or 0, cnt, mx, mn,
+                                                    fv[0] if fv else None, lv[0] if lv else None, fts, lts, now))
+                n += 1
+        conn.execute("INSERT INTO meta(key, value) VALUES('monthly_archived_until', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (repr(float(target)),))
+        return n
+
+    def cleanup(self, retention_days, archive_enabled=False):
+        """删除过期历史；开启上月汇总时先在同一事务内归档到水位线。
+        归档目标 = max(保留期截止点, 本月 1 日 0 点)：上月数据在月初即完整归档，
+        即将删除的本月早期数据也在删除前归档。按指标逐个 DELETE（走 idx_metric_ts），
+        不做全表扫描。"""
+        import datetime
+        cutoff = time.time() - retention_days * 86400
+        _n = datetime.datetime.now()
+        month_start = datetime.datetime(_n.year, _n.month, 1).timestamp()
+        conn = self._connect(write=True)
         try:
-            conn.execute("DELETE FROM metrics WHERE ts<?", (cutoff,))
-            conn.commit()
+            if archive_enabled:
+                # 归档 + 推进水位线在独立事务中原子完成；之后即使删除前进程退出，
+                # 下次也不会重复归档（ts < 水位线的行不再计入）
+                try:
+                    with conn:
+                        self._archive_until(conn, max(cutoff, month_start))
+                except Exception:
+                    traceback.print_exc()
+                    print("[fnmonitor] 月度汇总归档失败，本次仅清理过期数据")
+            with conn:
+                for metric in self._distinct_metrics(conn):
+                    conn.execute("DELETE FROM metrics WHERE metric=? AND ts<?", (metric, cutoff))
         except Exception:
-            pass
+            traceback.print_exc()
         finally:
             conn.close()
 
@@ -3581,8 +4124,15 @@ class Collector(threading.Thread):
         self._reload_config()
         # 同步休眠保护开关（配置保存后立即生效，无需重启）
         RUNTIME["standby_protect"] = bool(int(self.config.get("disk_standby_protect", 1) or 0))
+        RUNTIME["ec_fan_probe"] = bool(int(self.config.get("ec_fan_probe", 0) or 0))
         now = time.time()
         interval = self.config.get("interval", 10)
+        RUNTIME["interval"] = interval
+        # 每个采集周期统一探测一次硬盘电源状态，请求线程在周期内只读缓存
+        try:
+            disk_power_states(force=True)
+        except Exception:
+            pass
 
         snapshot = {}
         # ---- CPU ----
@@ -3816,20 +4366,8 @@ class Collector(threading.Thread):
             except Exception:
                 pass
 
-        # ---- 月初补全：进入新月份前 3 天内，把上月仍在 metrics 表中的数据归档到 monthly_summary ----
-        # 确保 retention 足够时月末数据不被遗漏（retention 不足时 cleanup 已增量叠加）
-        try:
-            import datetime as _dt
-            _now_ms = _dt.datetime.now()
-            if _now_ms.day <= 3 and now - getattr(self, "_last_monthly_rollover", 0) >= 86400:
-                self._last_monthly_rollover = now
-                if int(self.config.get("monthly_summary_enabled", 0) or 0):
-                    prev = _now_ms.replace(day=1) - _dt.timedelta(days=1)
-                    ms_start = _dt.datetime(prev.year, prev.month, 1).timestamp()
-                    ms_end = _dt.datetime(_now_ms.year, _now_ms.month, 1).timestamp()
-                    self.db._archive_to_monthly_range(ms_start, ms_end)
-        except Exception:
-            pass
+        # 月初补全已并入上面的 cleanup（水位线归档：上月数据在每月 1 日首次整点维护时
+        # 一次性完整归档，任何数据只计入一次；旧版月初 1-3 日各累加一次的重复计数已修复）
 
         # ---- Docker（每 30 秒；docker ps 为外部进程调用，容器列表变化慢，无需高频） ----
         if now - self._last_docker_ts >= 30:
@@ -3902,19 +4440,11 @@ class Collector(threading.Thread):
         # ---- 在线更新自动检查（每 6 小时）----
         # update_autoupdate（自动更新）：检查到新版本后自动下载并安装（解包覆盖 + 重启服务）
         # update_autocheck/update_autodownload（旧版兼容）：仅检查 / 仅下载到数据目录
+        # 网络请求（最多 5 个镜像 × 60s 超时）放到独立后台线程，绝不阻塞采集循环
         if self.updater and (self.config.get("update_autoupdate") or self.config.get("update_autocheck")):
             if now - self.updater._last_check >= UPDATE_CHECK_INTERVAL:
-                try:
-                    uinfo = self.updater.check(force=True)
-                    if uinfo.get("has_update") and uinfo.get("asset"):
-                        if self.config.get("update_autoupdate"):
-                            ok, fpk = self.updater.download_to_nas(uinfo["asset"])
-                            if ok:
-                                self.updater.install_fpk(fpk)  # 安装并自动重启
-                        elif self.config.get("update_autodownload") and not self.updater.downloaded_path():
-                            self.updater.download_to_nas(uinfo["asset"])
-                except Exception:
-                    pass
+                self.updater.start_auto_job(bool(self.config.get("update_autoupdate")),
+                                            bool(self.config.get("update_autodownload")))
 
         with self._lock:
             self.latest = snapshot
@@ -3935,31 +4465,83 @@ def _ver_tuple(v):
         return (0, 0, 0)
 
 
-def _gh_open(url, timeout=30):
-    """打开 GitHub 下载地址：直连失败后自动尝试加速镜像（返回 response，全失败抛最后异常）。"""
+def _gh_open(url, timeout=30, mirrors=None):
+    """打开 GitHub 下载地址：直连失败后自动尝试加速镜像（返回 response，全失败抛最后异常）。
+    注意：镜像只用于传输字节，内容必须再经官方 SHA256 校验后才能使用。"""
     last = None
-    for m in GH_MIRRORS:
+    for m in (GH_MIRRORS if mirrors is None else mirrors):
         u = (m + url) if m else url
         try:
             return urllib.request.urlopen(
                 urllib.request.Request(u, headers={"User-Agent": "fnmonitor"}), timeout=timeout)
         except Exception as e:
             last = e
-    raise last
+    raise last or RuntimeError("无可用下载地址")
+
+
+MAX_PACKAGE_BYTES = 64 * 1024 * 1024    # 安装包正常约 300KB，上限防止恶意镜像撑爆内存
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _safe_extract(t, dest):
+    """安全解包：逐项校验——拒绝绝对路径、'..'、指向目标目录之外（或含 '..'）的链接、
+    设备 / FIFO 等特殊文件，并去掉 setuid 位；Python 支持时再叠加 filter='data'。"""
+    import tarfile
+    root = os.path.realpath(dest)
+
+    def _inside(p):
+        rp = os.path.realpath(p)
+        return rp == root or rp.startswith(root + os.sep)
+
+    members = []
+    for m in t.getmembers():
+        name = m.name.replace("\\", "/")
+        parts = [x for x in name.split("/") if x not in ("", ".")]
+        if name.startswith("/") or re.match(r"^[A-Za-z]:", name) or ".." in parts:
+            raise ValueError("安装包含非法路径: %s" % m.name)
+        target = os.path.join(root, *parts) if parts else root
+        if not _inside(target):
+            raise ValueError("安装包路径越界: %s" % m.name)
+        if m.issym() or m.islnk():
+            ln = m.linkname.replace("\\", "/")
+            lparts = [x for x in ln.split("/") if x not in ("", ".")]
+            if ln.startswith("/") or ".." in lparts:
+                raise ValueError("安装包含越界链接: %s -> %s" % (m.name, m.linkname))
+            base = os.path.dirname(target) if m.issym() else root
+            if not _inside(os.path.join(base, *lparts)):
+                raise ValueError("安装包含越界链接: %s -> %s" % (m.name, m.linkname))
+        elif not (m.isfile() or m.isdir()):
+            raise ValueError("安装包含特殊文件: %s" % m.name)
+        m.mode = m.mode & 0o755
+        m.uid = m.gid = 0
+        members.append(m)
+    if hasattr(tarfile, "data_filter"):
+        t.extractall(dest, members=members, filter="data")   # 逐项校验之外再叠加官方过滤器
+    else:
+        t.extractall(dest, members=members)
 
 
 class UpdateManager:
     """基于 GitHub Releases 的在线更新：检查新版本、把安装包下载到 NAS（代理下载，
-    解决浏览器直连 GitHub 慢的问题）。自动检查由采集线程按周期调用。"""
+    解决浏览器直连 GitHub 慢的问题）。自动检查由采集线程按周期在后台线程中触发。
+
+    供应链加固（v2.18.0）：
+    - 每个安装包都必须有官方 SHA256：优先 GitHub Release 资产的 digest 字段；缺失时
+      直连 raw.githubusercontent.com 读取仓库 fnpack.json 中该版本的 sha256（不走镜像）；
+      两者都没有则拒绝下载 / 安装（fail-closed）。
+    - 镜像只用于传输字节，下载结果校验通过才会落盘或发给浏览器。
+    - 安装包名须精确匹配 fnmonitor-<版本>-<架构>.fpk；安全解包；安装互斥锁；拒绝降级 / 同版本重装。"""
 
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self._lock = threading.Lock()
+        self._install_lock = threading.Lock()
+        self._job = None
         self._last_check = 0.0
         self._cache = None            # 最近一次 check() 完整结果（30 分钟缓存）
         self._status = {"last_check": "", "latest": "", "has_update": False,
-                        "downloading": False, "downloaded_file": "", "download_dir": "",
-                        "error": ""}
+                        "downloading": False, "installing": False, "downloaded_file": "",
+                        "download_dir": "", "error": ""}
 
     # ---- 工具 ----
     def detect_arch(self):
@@ -3977,6 +4559,22 @@ class UpdateManager:
         with self._lock:
             return dict(self._status)
 
+    def _fnpack_sha256(self, version, arch):
+        """从仓库 fnpack.json（直连 raw.githubusercontent.com，不经镜像）读取指定版本的 sha256。"""
+        url = "https://raw.githubusercontent.com/%s/main/fnpack.json" % UPDATE_REPO
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "fnmonitor"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "ignore"))
+            for app in (data.get("apps") or {}).values():
+                rel = ((app or {}).get("releases") or {}).get(version) or {}
+                sha = str(((rel.get("packages") or {}).get(arch) or {}).get("sha256") or "").lower()
+                if _SHA256_RE.match(sha):
+                    return sha
+        except Exception:
+            pass
+        return ""
+
     # ---- 检查 ----
     def check(self, force=False):
         """查询 GitHub 最新 Release。结果缓存 30 分钟；force=True 跳过缓存。"""
@@ -3993,32 +4591,37 @@ class UpdateManager:
                 "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO,
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "fnmonitor"})
             with urllib.request.urlopen(req, timeout=10) as r:
-                rel = json.loads(r.read().decode("utf-8", "ignore"))
+                rel = json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "ignore"))
             latest = str(rel.get("tag_name") or "").lstrip("vV")
+            if not re.match(r"^\d+(\.\d+){1,3}$", latest):
+                raise ValueError("Release 版本号格式异常: %s" % latest[:40])
             info["ok"] = True
             info["latest"] = latest
             info["has_update"] = _ver_tuple(latest) > _ver_tuple(VERSION)
             info["notes"] = str(rel.get("body") or "")[:3000]
-            info["published_at"] = str(rel.get("published_at") or "")
-            if rel.get("html_url"):
-                info["html_url"] = rel["html_url"]
-            # 选当前架构的 fpk 资产（x86 优先精确匹配，arm 同理）；记录官方 digest 供下载后校验
-            def _mk_asset(a):
-                return {"name": a.get("name"), "size": int(a.get("size") or 0),
-                        "download_url": a.get("browser_download_url"),
-                        "digest": str(a.get("digest") or "").replace("sha256:", "")}
+            info["published_at"] = str(rel.get("published_at") or "")[:40]
+            hu = str(rel.get("html_url") or "")
+            if hu.startswith("https://github.com/"):
+                info["html_url"] = hu
+            # 只接受精确命名的当前架构安装包（去掉旧版「任一同平台包」兜底）
             want = "fnmonitor-%s-%s.fpk" % (latest, arch)
             for a in rel.get("assets") or []:
                 if str(a.get("name")) == want:
-                    info["asset"] = _mk_asset(a)
-                    break
-            if info["asset"] is None:  # 兜底：任一同名平台包
-                for a in rel.get("assets") or []:
-                    if str(a.get("name", "")).endswith("-%s.fpk" % arch):
-                        info["asset"] = _mk_asset(a)
+                    url = str(a.get("browser_download_url") or "")
+                    if not url.startswith("https://github.com/"):
                         break
+                    digest = str(a.get("digest") or "").lower()
+                    digest = digest[7:] if digest.startswith("sha256:") else ""
+                    src = "github"
+                    if not _SHA256_RE.match(digest):
+                        digest, src = self._fnpack_sha256(latest, arch), "fnpack.json"
+                    info["asset"] = {"name": want, "size": int(a.get("size") or 0),
+                                     "download_url": url,
+                                     "digest": digest if _SHA256_RE.match(digest or "") else "",
+                                     "digest_source": src if digest else ""}
+                    break
         except Exception as e:
-            info["error"] = str(e)
+            info["error"] = str(e)[:300]
         with self._lock:
             self._cache = dict(info)
             self._last_check = time.time()
@@ -4030,39 +4633,69 @@ class UpdateManager:
                 st["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
         return info
 
-    # ---- 下载到 NAS ----
-    def download_to_nas(self, asset, dest_dir=None):
-        """把安装包下载到指定目录（默认 数据目录/update/），自动尝试镜像加速，
-        下载后按官方 SHA256 校验。返回 (成功?, 文件路径/错误)。"""
-        name = asset.get("name") or "fnmonitor.fpk"
-        url = asset.get("download_url")
-        if not url:
-            return False, "资产缺少下载地址"
-        ddir = dest_dir or self.update_dir()
+    # ---- 下载（镜像传输 + 官方 SHA256 校验） ----
+    def fetch_verified(self, asset):
+        """依次尝试直连 / 各镜像下载安装包到内存，SHA256 与官方值一致才返回。
+        返回 (bytes, None) 或 (None, 错误信息)。"""
+        expect = str((asset or {}).get("digest") or "").lower()
+        if not _SHA256_RE.match(expect):
+            return None, "缺少官方 SHA256 校验值（Release digest 与 fnpack.json 均未提供），已拒绝下载"
+        url = (asset or {}).get("download_url") or ""
+        if not url.startswith("https://github.com/"):
+            return None, "安装包下载地址异常"
+        last = "下载失败"
+        with self._lock:
+            self._status["downloading"] = True
+        try:
+            for m in GH_MIRRORS:
+                try:
+                    with _gh_open(url, timeout=60, mirrors=[m]) as r:
+                        buf = io.BytesIO()
+                        while True:
+                            chunk = r.read(65536)
+                            if not chunk:
+                                break
+                            buf.write(chunk)
+                            if buf.tell() > MAX_PACKAGE_BYTES:
+                                raise ValueError("安装包体积异常")
+                    data = buf.getvalue()
+                    if hmac.compare_digest(hashlib.sha256(data).hexdigest(), expect):
+                        return data, None
+                    last = "安装包 SHA256 校验失败（%s）" % ("直连" if not m else "镜像 " + m)
+                except Exception as e:
+                    last = str(e)[:200]
+            return None, last
+        finally:
+            with self._lock:
+                self._status["downloading"] = False
+
+    @staticmethod
+    def _dest_allowed(ddir, default_dir):
+        """NAS 下载目录只允许：默认 数据目录/update，或存储池 /volN/ 下的路径。"""
         if not os.path.isabs(ddir):
-            return False, "请填写以 / 开头的绝对路径（如 /vol1/更新包）"
+            return False
+        rp = os.path.realpath(ddir)
+        if rp == os.path.realpath(default_dir):
+            return True
+        return bool(re.match(r"^/vol\d+/", rp + "/")) and rp.count("/") >= 2
+
+    def download_to_nas(self, asset, dest_dir=None):
+        """把安装包下载并校验后保存到指定目录（默认 数据目录/update/）。返回 (成功?, 文件路径/错误)。"""
+        name = (asset or {}).get("name") or ""
+        if not re.match(r"^fnmonitor-[0-9.]+-(x86|arm)\.fpk$", name):
+            return False, "安装包文件名异常"
+        ddir = dest_dir or self.update_dir()
+        if not self._dest_allowed(ddir, self.update_dir()):
+            return False, "保存目录须为存储池下的绝对路径（如 /vol1/更新包）"
+        data, err = self.fetch_verified(asset)
+        if data is None:
+            return False, err
         final = os.path.join(ddir, name)
         tmp = final + ".tmp"
         try:
             os.makedirs(ddir, exist_ok=True)
-            with self._lock:
-                self._status["downloading"] = True
-            with _gh_open(url, timeout=60) as r, open(tmp, "wb") as f:
-                while True:
-                    chunk = r.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            # 完整性校验：GitHub API 提供的官方 sha256（镜像下载也不怕被篡改）
-            expect = str(asset.get("digest") or "").lower()
-            if expect:
-                h = hashlib.sha256()
-                with open(tmp, "rb") as f:
-                    for chunk in iter(lambda: f.read(65536), b""):
-                        h.update(chunk)
-                if h.hexdigest() != expect:
-                    os.remove(tmp)
-                    return False, "安装包 SHA256 校验失败（下载不完整或被篡改），请重试"
+            with open(tmp, "wb") as f:
+                f.write(data)
             os.replace(tmp, final)
             if dest_dir is None:  # 仅记录默认目录的下载状态
                 with self._lock:
@@ -4075,17 +4708,70 @@ class UpdateManager:
             except Exception:
                 pass
             return False, str(e)
+
+    # ---- 一键更新：检查 → 下载校验 → 安装（互斥、拒绝降级） ----
+    def install_latest(self, force_check=False):
+        if not self._install_lock.acquire(blocking=False):
+            return {"ok": False, "error": "正在安装更新，请稍候"}
+        try:
+            with self._lock:
+                self._status["installing"] = True
+            info = self.check(force=force_check)
+            if not info.get("ok"):
+                return {"ok": False, "error": info.get("error") or "检查更新失败"}
+            if _ver_tuple(info.get("latest")) <= _ver_tuple(VERSION):
+                return {"ok": False, "error": "当前已是最新版本（%s），不执行降级或重复安装" % VERSION}
+            asset = info.get("asset")
+            if not asset:
+                return {"ok": False, "error": "Release 中未找到 %s 平台安装包" % info.get("arch")}
+            ok, fpk = self.download_to_nas(asset)
+            if not ok:
+                return {"ok": False, "error": "下载失败: %s" % fpk}
+            ok, msg = self.install_fpk(fpk, expect_sha256=asset.get("digest"))
+            if ok:
+                return {"ok": True, "note": msg, "version": info.get("latest")}
+            return {"ok": False, "error": msg}
         finally:
             with self._lock:
-                self._status["downloading"] = False
+                self._status["installing"] = False
+            self._install_lock.release()
+
+    def start_auto_job(self, autoupdate, autodownload):
+        """采集线程调用：在后台线程执行自动检查 / 下载 / 安装，已有任务在跑则跳过。"""
+        if self._job and self._job.is_alive():
+            return
+
+        def _run():
+            try:
+                uinfo = self.check(force=True)
+                if uinfo.get("has_update") and uinfo.get("asset"):
+                    if autoupdate:
+                        self.install_latest()
+                    elif autodownload and not self.downloaded_path():
+                        self.download_to_nas(uinfo["asset"])
+            except Exception:
+                traceback.print_exc()
+
+        self._job = threading.Thread(target=_run, name="fnmonitor-update", daemon=True)
+        self._job.start()
 
     # ---- 自动安装（解包 fpk 覆盖应用目录后自我重启） ----
-    def install_fpk(self, fpk_path):
+    def install_fpk(self, fpk_path, expect_sha256=None):
         """解包 fpk（app.tgz + cmd + manifest）并覆盖应用目录（先备份，校验失败自动回滚），
         成功后延迟 1.5 秒替换当前进程重启服务。返回 (成功?, 消息)。"""
         import shutil
         import sys
         import tarfile
+        if expect_sha256:
+            h = hashlib.sha256()
+            try:
+                with open(fpk_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+            except Exception as e:
+                return False, "读取安装包失败: %s" % e
+            if not hmac.compare_digest(h.hexdigest(), str(expect_sha256).lower()):
+                return False, "安装包 SHA256 校验失败，已拒绝安装"
         app_dir = os.path.dirname(os.path.abspath(__file__))       # 应用安装目录（NAS 上 server.py 平铺于 TRIM_APPDEST）
         tmp = os.path.join(self.data_dir, "update", "_extract")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -4093,13 +4779,13 @@ class UpdateManager:
         try:
             # fpk 结构：app.tgz（app 内容压缩包）+ cmd/ + manifest，均为平铺
             with tarfile.open(fpk_path, "r:*") as t:
-                t.extractall(tmp)
+                _safe_extract(t, tmp)
             inner = os.path.join(tmp, "app.tgz")
-            if os.path.exists(inner):
+            if os.path.isfile(inner) and not os.path.islink(inner):
                 app_src = os.path.join(tmp, "app")
                 os.makedirs(app_src, exist_ok=True)
                 with tarfile.open(inner, "r:*") as t2:
-                    t2.extractall(app_src)                         # server.py、ui/ 等平铺在内
+                    _safe_extract(t2, app_src)                     # server.py、ui/ 等平铺在内
             else:
                 app_src = tmp if os.path.exists(os.path.join(tmp, "server.py")) else None
             if not app_src or not os.path.exists(os.path.join(app_src, "server.py")):
@@ -4213,25 +4899,180 @@ class MonitorApp:
         self._power_stats_ts = 0.0
         self._disk_standby_cache = None
         self._disk_standby_ts = 0.0
-        # ---- 登录鉴权：会话持久化到 data_dir/sessions.json，内存缓存加速校验 ----
+        # ---- 登录鉴权：会话持久化到 配置目录/sessions.json（0600，只存 sid 哈希），内存缓存加速校验 ----
         self._sessions = {}
+        self._sessions_lock = threading.RLock()
+        self.limiter = LoginLimiter()
         self._load_sessions()
+        self._static_cache = {}
+        self._export_sem = threading.BoundedSemaphore(2)   # 报告 / 导出并发上限
+        self._apps_refresh_ts = 0.0
 
     def make_handler(self):
         app = self
 
-        class Handler(BaseHTTPRequestHandler):
-            # HTTP/1.1 长连接：浏览器复用 TCP 连接，避免每请求新建线程（原 HTTP/1.0
-            # 每个请求都新建/销毁线程，多客户端高频轮询时线程与 glibc malloc arena
-            # 反复增长，是进程 RSS 虚高的重要原因）；timeout 保证空闲连接最终回收
-            protocol_version = "HTTP/1.1"
-            timeout = 65
+        # ------------------------------------------------------------------
+        # 请求安全规则（v2.18.0）
+        # 1) Host 策略（防 DNS rebinding）：未启用登录口令时，Host 必须是 IP 字面量 /
+        #    localhost / 单标签主机名 / .local .lan .home .internal .localdomain 等局域网
+        #    后缀，否则 403（API 返回 JSON，页面返回中文说明页）；启用口令后任意 Host 均可。
+        # 2) CSRF：所有改变状态的接口只接受 POST，且必须同时满足
+        #    Content-Type: application/json、请求头 X-FNM-Request: 1；若带 Origin 头，
+        #    其 host:port 必须与请求 Host 一致（忽略协议），否则 403 JSON。
+        #    自定义请求头会强制跨站请求走 CORS 预检，而本服务从不放行 CORS。
+        #    GET 只用于读取（例外：/api/update/download?to=browser 仅流式回传已校验的安装包）。
+        # 3) 资源上限：请求体 ≤ 1 MiB（超出 413，不读取）；空闲长连接 30 秒超时；
+        #    并发连接（处理线程）总数与单 IP 数量有上限，超出直接 503（见 BoundedHTTPServerMixin）。
+        # ------------------------------------------------------------------
+        CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+               "img-src 'self' data:; connect-src 'self'; frame-ancestors *")
+        POST_ONLY = {"/api/auth/password", "/api/auth/setup", "/api/auth/logout", "/api/docker/action",
+                     "/api/config/save", "/api/update/install"}
 
-            def do_GET(self):
+        class Handler(BaseHTTPRequestHandler):
+            # HTTP/1.1 长连接：浏览器复用 TCP 连接，避免每请求新建线程；timeout 保证空闲连接
+            # 30 秒内回收（并发连接数另有上限）
+            protocol_version = "HTTP/1.1"
+            timeout = 30
+            server_version = "fnMonitor"
+            sys_version = ""
+
+            # ---- 公共：安全头 / 发送 ----
+            def end_headers(self):
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "same-origin")
+                self.send_header("Content-Security-Policy", CSP)
+                super().end_headers()
+
+            @property
+            def client_ip(self):
+                return norm_ip(self.client_address[0] if self.client_address else "")
+
+            def _accepts_gzip(self):
+                return "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+
+            def _send(self, status, body, ctype, headers=None, cache="no-store", compress=True):
+                gz = False
+                if compress and len(body) > 1024 and self._accepts_gzip():
+                    body = gzip.compress(body, 5)
+                    gz = True
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                if cache:
+                    self.send_header("Cache-Control", cache)
+                if compress:
+                    self.send_header("Vary", "Accept-Encoding")
+                if gz:
+                    self.send_header("Content-Encoding", "gzip")
+                for k, v in (headers or []):
+                    self.send_header(k, v)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _json(self, obj, status=200, cookie=None, headers=None):
+                """发送 JSON。cookie=(sid, max_age) 设置会话；cookie="clear" 清除。"""
+                hdrs = list(headers or [])
+                if cookie == "clear":
+                    hdrs.append(("Set-Cookie", "fnmp_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"))
+                elif cookie:
+                    hdrs.append(("Set-Cookie", "fnmp_sid=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
+                                 % (cookie[0], cookie[1])))
+                self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8", hdrs)
+
+            def _send_bytes(self, body):
+                self._send(200, body, "application/json; charset=utf-8")
+
+            def _download(self, body, ctype, filename):
+                self._send(200, body, ctype, [("Content-Disposition", 'attachment; filename="%s"' % filename)],
+                           compress=False)
+
+            def _download_stream(self, chunks, ctype, filename):
+                """分块传输（Transfer-Encoding: chunked）流式下载，内存占用与数据量无关。"""
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
                 try:
-                    self._handle()
+                    pending = []
+                    size = 0
+                    for c in chunks:
+                        if not c:
+                            continue
+                        pending.append(c)
+                        size += len(c)
+                        if size >= 65536:
+                            data = b"".join(pending)
+                            self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                            pending, size = [], 0
+                    if pending:
+                        data = b"".join(pending)
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                    self.wfile.write(b"0\r\n\r\n")
                 except (BrokenPipeError, ConnectionResetError):
-                    pass
+                    self.close_connection = True
+                except Exception:
+                    traceback.print_exc()
+                    self.close_connection = True   # 已发出部分数据：只能断开连接
+
+            def _serve_html(self, name):
+                """静态页面：ETag 协商缓存（Cache-Control: no-cache，每次向服务器校验，
+                更新后 ETag 变化即取新页面）+ gzip。"""
+                ent = app._static_entry(name)
+                if ent is None:
+                    self.send_error(404, "Not Found")
+                    return
+                body, gz, etag = ent
+                inm = self.headers.get("If-None-Match") or ""
+                if etag in [x.strip() for x in inm.split(",")]:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Vary", "Accept-Encoding")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                use_gz = gz is not None and self._accepts_gzip()
+                data = gz if use_gz else body
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                self.send_header("Vary", "Accept-Encoding")
+                if use_gz:
+                    self.send_header("Content-Encoding", "gzip")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _deny(self, status, code, message, path):
+                self.close_connection = True  # 可能有未读取的请求体，不复用连接
+                if path.startswith("/api/") or self.command == "POST":
+                    self._json({"ok": False, "error": code, "message": message}, status=status)
+                else:
+                    self._send(status, HOST_BLOCKED_HTML if code == "host_not_allowed" else
+                               ("<h3>%s</h3>" % message).encode("utf-8"), "text/html; charset=utf-8")
+
+            def _host_ok(self):
+                if app._auth_required():
+                    return True
+                return host_is_lan(self.headers.get("Host") or "")
+
+            def _unauthorized(self, path):
+                if path.startswith("/api/"):
+                    self._json({"ok": False, "error": "未登录", "auth_required": True}, status=401)
+                else:
+                    self.send_error(401, "Unauthorized")
+
+            def _wrap(self, fn):
+                try:
+                    fn()
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    self.close_connection = True
                 except Exception:
                     traceback.print_exc()
                     try:
@@ -4239,14 +5080,31 @@ class MonitorApp:
                     except Exception:
                         pass
 
+            def do_GET(self):
+                self._wrap(self._handle)
+
+            def do_POST(self):
+                self._wrap(self._handle_post)
+
+            # ---- GET：只读接口 ----
             def _handle(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
                 qs = parse_qs(parsed.query)
 
+                if not self._host_ok():
+                    self._deny(403, "host_not_allowed", "通过域名访问前请先在局域网内开启登录口令", path)
+                    return
+                # 改变状态的接口不接受 GET（前端收到 405 才回退旧接口）
+                if path in POST_ONLY or (path == "/api/update/download"
+                                         and (qs.get("to") or ["nas"])[0] != "browser"):
+                    self._json({"ok": False, "error": "method_not_allowed", "message": "该接口仅支持 POST"},
+                               status=405, headers=[("Allow", "POST")])
+                    return
+
                 # ---- 鉴权：登录页与登录接口始终可访问（无需会话） ----
                 if path == "/login.html":
-                    self._serve_file(os.path.join(app.www_dir, "login.html"), "text/html; charset=utf-8")
+                    self._serve_html("login.html")
                     return
                 if path == "/api/auth/session":
                     self._json(app.api_auth_session(self.headers))
@@ -4257,26 +5115,17 @@ class MonitorApp:
                 # ---- 鉴权拦截：启用口令且未登录时，HTML 跳登录页 / API 返 401 ----
                 if not app._check_auth(self.headers):
                     if path in ("/", "/index.html"):
-                        self._serve_file(os.path.join(app.www_dir, "login.html"), "text/html; charset=utf-8")
+                        self._serve_html("login.html")
                         return
-                    if path.startswith("/api/"):
-                        body = json.dumps({"ok": False, "error": "未登录",
-                                           "auth_required": True}, ensure_ascii=False).encode("utf-8")
-                        self.send_response(401)
-                        self.send_header("Content-Type", "application/json; charset=utf-8")
-                        self.send_header("Content-Length", str(len(body)))
-                        self.send_header("Cache-Control", "no-store")
-                        self.end_headers()
-                        self.wfile.write(body)
-                        return
-                    self.send_error(401, "Unauthorized")
+                    self._unauthorized(path)
                     return
 
                 if path in ("/", "/index.html"):
-                    self._serve_file(os.path.join(app.www_dir, "index.html"), "text/html; charset=utf-8")
+                    self._serve_html("index.html")
                     return
                 if path == "/favicon.ico":
                     self.send_response(204)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 if path == "/api/overview":
@@ -4352,199 +5201,198 @@ class MonitorApp:
                     force = (qs.get("force") or ["0"])[0] in ("1", "true", "yes")
                     self._json(app.api_update_check(force=force))
                     return
-                if path == "/api/update/install":
-                    self._json(app.api_update_install())
-                    return
                 if path == "/api/update/download":
-                    to = (qs.get("to") or ["nas"])[0]
-                    if to == "browser":
-                        # NAS 端代理下载到浏览器：用户电脑无需直连 GitHub（自动尝试加速镜像）
-                        asset, err = app.api_update_asset()
-                        if err:
-                            self._json({"ok": False, "error": err})
-                            return
-                        try:
-                            with _gh_open(asset["download_url"], timeout=60) as r:
-                                self.send_response(200)
-                                self.send_header("Content-Type", "application/octet-stream")
-                                self.send_header("Content-Length", str(asset.get("size") or r.headers.get("Content-Length") or 0))
-                                self.send_header("Content-Disposition",
-                                                 'attachment; filename="%s"' % asset["name"].replace('"', ""))
-                                self.end_headers()
-                                while True:
-                                    chunk = r.read(65536)
-                                    if not chunk:
-                                        break
-                                    self.wfile.write(chunk)
-                        except (BrokenPipeError, ConnectionResetError):
-                            pass
-                        except Exception as e:
-                            traceback.print_exc()
-                            try:
-                                self._json({"ok": False, "error": str(e)})
-                            except Exception:
-                                pass
+                    # to=browser：NAS 端代理下载 → 官方 SHA256 校验通过后才发给浏览器
+                    asset, err = app.api_update_asset()
+                    data = None
+                    if not err:
+                        data, err = app.updater.fetch_verified(asset)
+                    if err or data is None:
+                        self._json({"ok": False, "error": err or "下载失败"})
                         return
-                    dest = (qs.get("path") or [""])[0].strip()
-                    self._json(app.api_update_download_nas(dest_dir=dest or None))
+                    self._send(200, data, "application/octet-stream",
+                               [("Content-Disposition", 'attachment; filename="%s"' % asset["name"]),
+                                ("X-Content-SHA256", asset.get("digest") or "")], compress=False)
                     return
-                if path == "/api/report":
-                    fmt = (qs.get("format") or ["json"])[0]
-                    if fmt == "html":
-                        body = app.api_report_html()
-                        self._download(body, "text/html; charset=utf-8",
-                                       "fnmonitor_report_%s.html" % time.strftime("%Y%m%d_%H%M%S"))
-                    else:
-                        self._json(app.api_report())
-                    return
-                if path == "/api/export":
-                    export_type = (qs.get("type") or ["history"])[0]
-                    if export_type == "status":
-                        body = json.dumps(app.api_export_status(), ensure_ascii=False, indent=2).encode("utf-8")
-                        self._download(body, "application/json; charset=utf-8",
-                                       "fnmonitor_status_%s.json" % time.strftime("%Y%m%d_%H%M%S"))
-                    elif export_type == "traffic":
-                        range_ = (qs.get("range") or ["7d"])[0]
-                        body = app.api_traffic_csv(range_)
-                        self._download(body, "text/csv; charset=utf-8",
-                                       "fnmonitor_traffic_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
-                    elif export_type == "power":
-                        range_ = (qs.get("range") or ["7d"])[0]
-                        body = app.api_power_csv(range_)
-                        self._download(body, "text/csv; charset=utf-8",
-                                       "fnmonitor_power_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
-                    else:
-                        range_ = (qs.get("range") or ["7d"])[0]
-                        body = app.api_export_history_csv(range_)
-                        self._download(body, "text/csv; charset=utf-8",
-                                       "fnmonitor_history_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
+                if path in ("/api/report", "/api/export"):
+                    if not app._export_sem.acquire(blocking=False):
+                        self._json({"ok": False, "error": "已有导出 / 报告任务在进行，请稍后再试"}, status=503,
+                                   headers=[("Retry-After", "5")])
+                        return
+                    try:
+                        self._handle_export(path, qs)
+                    finally:
+                        app._export_sem.release()
                     return
                 self.send_error(404, "Not Found")
 
-            def do_POST(self):
-                try:
-                    self._handle_post()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                except Exception:
-                    traceback.print_exc()
+            def _handle_export(self, path, qs):
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                if path == "/api/report":
+                    fmt = (qs.get("format") or ["json"])[0]
+                    if fmt == "html":
+                        self._download(app.api_report_html(), "text/html; charset=utf-8",
+                                       "fnmonitor_report_%s.html" % stamp)
+                    else:
+                        self._json(app.api_report())
+                    return
+                export_type = (qs.get("type") or ["history"])[0]
+                range_ = (qs.get("range") or ["7d"])[0]
+                if export_type == "status":
+                    body = json.dumps(app.api_export_status(), ensure_ascii=False, indent=2).encode("utf-8")
+                    self._download(body, "application/json; charset=utf-8", "fnmonitor_status_%s.json" % stamp)
+                elif export_type == "traffic":
+                    self._download_stream(app.iter_traffic_csv(range_), "text/csv; charset=utf-8",
+                                          "fnmonitor_traffic_%s.csv" % stamp)
+                elif export_type == "power":
+                    self._download_stream(app.iter_power_csv(range_), "text/csv; charset=utf-8",
+                                          "fnmonitor_power_%s.csv" % stamp)
+                else:
+                    self._download_stream(app.iter_history_csv(range_), "text/csv; charset=utf-8",
+                                          "fnmonitor_history_%s.csv" % stamp)
+
+            # ---- POST：改变状态的接口 ----
+            def _csrf_ok(self):
+                ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype != "application/json":
+                    return False
+                if (self.headers.get("X-FNM-Request") or "").strip() != "1":
+                    return False
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin:
                     try:
-                        self.send_error(500)
+                        o = urlparse(origin)
                     except Exception:
-                        pass
+                        return False
+                    if o.scheme not in ("http", "https") or not o.hostname:
+                        return False          # 包括 Origin: null
+                    oname = o.hostname.lower().rstrip(".")
+                    try:
+                        oport = o.port or (443 if o.scheme == "https" else 80)
+                    except ValueError:
+                        return False
+                    hname, hport = split_host_port(self.headers.get("Host") or "")
+                    if oname != hname:
+                        return False
+                    if hport is None:
+                        return oport in (80, 443)
+                    return oport == hport
+                return True
+
+            def _read_body(self):
+                """读取并解析 JSON 请求体；超限 / 格式错误时已发送错误响应并返回 None。"""
+                if self.headers.get("Transfer-Encoding"):
+                    self._deny(411, "length_required", "请求须带 Content-Length", "/api/")
+                    return None
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > MAX_BODY_BYTES:
+                    self._deny(413, "payload_too_large", "请求体过大（上限 1 MiB）", "/api/")
+                    return None
+                body = self.rfile.read(length) if length else b""
+                try:
+                    data = json.loads(body.decode("utf-8", "strict") or "{}")
+                except Exception:
+                    data = None
+                if not isinstance(data, dict):
+                    self._json({"ok": False, "error": "bad_json", "message": "请求体须为 JSON 对象"}, status=400)
+                    return None
+                return data
 
             def _handle_post(self):
-                parsed = urlparse(self.path)
-                path = parsed.path
-
-                def _read_json():
-                    try:
-                        length = int(self.headers.get("Content-Length") or 0)
-                        body = self.rfile.read(length) if length else b""
-                        return json.loads(body.decode("utf-8", "ignore") or "{}")
-                    except Exception:
-                        return {}
+                path = urlparse(self.path).path
+                if not self._host_ok():
+                    self._deny(403, "host_not_allowed", "通过域名访问前请先在局域网内开启登录口令", path)
+                    return
+                if not self._csrf_ok():
+                    self._deny(403, "csrf_rejected",
+                               "请求被拒绝：缺少 X-FNM-Request 头、Content-Type 不是 application/json 或来源不一致",
+                               path)
+                    return
+                data = self._read_body()
+                if data is None:
+                    return
+                ip = self.client_ip
 
                 # ---- 鉴权：登录 / 初始化 / 登出接口始终可访问 ----
                 if path == "/api/auth/password":
-                    data = _read_json()
-                    resp, sid, ma = app.api_auth_password(data)
-                    self._json_with_cookie(resp, sid, ma)
+                    wait = app.limiter.retry_after(ip)
+                    if wait:
+                        self._json({"ok": False, "error": "尝试次数过多，请 %d 秒后再试" % wait,
+                                    "retry_after": wait}, status=429, headers=[("Retry-After", str(wait))])
+                        return
+                    resp, cookie = app.api_auth_password(data, ip)
+                    self._json(resp, cookie=cookie)
                     return
                 if path == "/api/auth/setup":
-                    data = _read_json()
-                    resp, sid, ma = app.api_auth_setup(data)
-                    self._json_with_cookie(resp, sid, ma)
+                    resp, cookie = app.api_auth_setup(data, ip)
+                    self._json(resp, cookie=cookie)
                     return
                 if path == "/api/auth/logout":
-                    resp = app.api_auth_logout(self.headers)
-                    self._json_with_cookie(resp, None, 0)
+                    self._json(app.api_auth_logout(self.headers), cookie="clear")
                     return
-                # ---- 鉴权拦截：启用口令且未登录时，POST 接口返 401 ----
                 if not app._check_auth(self.headers):
-                    body = json.dumps({"ok": False, "error": "未登录",
-                                       "auth_required": True}, ensure_ascii=False).encode("utf-8")
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._unauthorized(path)
                     return
 
                 if path == "/api/docker/action":
-                    data = _read_json()
                     cid = str(data.get("id") or "").strip()
                     act = str(data.get("action") or "").strip()
                     self._json(app.api_docker_action(cid, act))
                     return
                 if path == "/api/ui":
-                    data = _read_json()
                     self._json(app.api_ui_set(data))
                     return
                 if path == "/api/config/save":
-                    data = _read_json()
-                    self._json(app.api_config_save(data))
+                    resp, status, cookie = app.api_config_save(data, self.headers, ip)
+                    hdrs = [("Retry-After", str(resp.get("retry_after")))] if status == 429 else None
+                    self._json(resp, status=status, cookie=cookie, headers=hdrs)
                     return
-                self.send_error(404, "Not Found")
-
-            def _json(self, obj):
-                self._send_bytes(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
-
-            def _json_with_cookie(self, obj, sid=None, max_age=0):
-                """发送 JSON 响应，并附带会话 Cookie（sid=None 时清除 Cookie）。"""
-                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                if sid:
-                    self.send_header("Set-Cookie",
-                                     "fnmp_sid=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
-                                     % (sid, max_age))
-                else:
-                    self.send_header("Set-Cookie",
-                                     "fnmp_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _send_bytes(self, body):
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _download(self, body, ctype, filename):
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _serve_file(self, path, ctype):
-                try:
-                    with open(path, "rb") as f:
-                        body = f.read()
-                except Exception:
-                    self.send_error(404, "Not Found")
+                if path == "/api/update/install":
+                    self._json(app.api_update_install())
                     return
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+                if path == "/api/update/download":
+                    dest = str(data.get("path") or "").strip()
+                    self._json(app.api_update_download_nas(dest_dir=dest or None))
+                    return
+                self._json({"ok": False, "error": "not_found"}, status=404)
 
             def log_message(self, fmt, *args):
                 pass  # 静默访问日志
 
         return Handler
 
+    def _static_entry(self, name):
+        """静态页面缓存：(原文, gzip 版本, ETag)，文件 mtime/size 变化（升级覆盖）后自动失效。"""
+        path = os.path.join(self.www_dir, name)
+        try:
+            st = os.stat(path)
+        except Exception:
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        ent = self._static_cache.get(name)
+        if ent and ent[0] == key:
+            return ent[1]
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except Exception:
+            return None
+        etag = 'W/"%s"' % hashlib.sha256(body).hexdigest()[:20]
+        gz = gzip.compress(body, 6) if len(body) > 1024 else None
+        val = (body, gz, etag)
+        self._static_cache[name] = (key, val)
+        return val
+
     # ---- API 实现 ----
+    def _public_config(self):
+        """对外配置：去掉口令哈希，附加 auth_password_set / auth_has_password（旧前端兼容）。"""
+        c = public_config(self.config)
+        c["auth_has_password"] = c["auth_password_set"]
+        return c
+
     def api_overview(self):
         """总览快照（返回预序列化 bytes，5 秒内多客户端复用同一份）。
 
@@ -4556,7 +5404,7 @@ class MonitorApp:
             return self._overview_bytes
         snap = self.collector.get_snapshot()
         snap["system"] = self._cached_system_info(now)
-        snap["config"] = dict(self.config)
+        snap["config"] = self._public_config()
         self._overview_bytes = json.dumps(snap, ensure_ascii=False).encode("utf-8")
         self._overview_ts = now
         return self._overview_bytes
@@ -4587,25 +5435,35 @@ class MonitorApp:
             self._proc_ts = now
         return self._proc_cache
 
+    _RANGE_SECONDS = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}
+    _METRIC_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,200}$")   # 指标名含挂载路径，可能有中文
+
+    def _span(self, seconds):
+        """「全部」范围的时间跨度：按保留天数估算（用于计算降采样桶宽）。"""
+        return seconds or max(1, int(self.config.get("retention_days", 7) or 7)) * 86400
+
     def api_history(self, metric, range_):
         """趋势查询（结果缓存 25 秒）。
 
-        历史数据每 history_interval(默认 60) 秒才新增一个点，前端却每 30 秒拉 9 个
-        指标、多客户端时请求成倍放大；「全部」范围单次查询最多 43200 行，缓存后
-        同周期内只查一次库。缓存项上限 24 个，超出整体清空（组合数有限，足够用）。"""
+        历史数据每 history_interval(默认 60) 秒才新增一个点；查询在 SQL 内按时间桶
+        降采样（最多约 720 点），缓存后同周期内只查一次库。缓存项上限 48 个。"""
+        if not self._METRIC_RE.match(str(metric or "")):
+            return {"metric": "", "range": range_, "points": []}
+        if range_ not in self._RANGE_SECONDS:
+            range_ = "1h"
         key = (metric, range_)
         now = time.time()
         cached = self._hist_cache.get(key)
         if cached and now - cached[0] < 25:
             return cached[1]
-        if len(self._hist_cache) > 24:
+        if len(self._hist_cache) > 48:
             self._hist_cache.clear()
         data = self._api_history_impl(metric, range_)
         self._hist_cache[key] = (now, data)
         return data
 
     def _api_history_impl(self, metric, range_):
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 3600)
+        seconds = self._RANGE_SECONDS.get(range_, 3600)
         if metric == "net":
             return self.api_net_history(range_)
         if metric == "net_bytes":
@@ -4614,7 +5472,7 @@ class MonitorApp:
             return self.api_ctr_history(range_)
         if metric == "diskio":
             return self.api_diskio_history(range_)
-        rows = self.collector.db.query(metric, seconds)
+        rows = self.collector.db.query_series(metric, seconds, span=self._span(seconds))
         # 实时兜底：历史为空或最新点过旧时，附加当前实时值，保证趋势图始终有数据
         now = time.time()
         latest_ts = rows[-1][0] if rows else 0
@@ -4622,10 +5480,8 @@ class MonitorApp:
             val = self._live_value(metric, self.collector.get_snapshot())
             if val is not None:
                 rows = list(rows) + [(now, val)]
-        # 降采样：最多返回 ~720 个点
-        step = max(1, len(rows) // 720)
-        sampled = rows[::step]
-        return {"metric": metric, "range": range_, "points": [[t, v] for t, v in sampled]}
+        return {"metric": metric, "range": range_, "points": [[t, round(v, 2) if isinstance(v, float) else v]
+                                                             for t, v in rows]}
 
     def _live_value(self, metric, snap):
         """从最新实时快照取指定指标的当前值（用于历史不足时的趋势兜底）。"""
@@ -4659,29 +5515,14 @@ class MonitorApp:
         return None
 
     def api_diskio_history(self, range_):
-        """磁盘 IO 历史：聚合全部磁盘读/写速率（MB/s），返回 {r:[], w:[]}。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 3600)
-        cutoff = (time.time() - seconds) if seconds else 0
-        r_map, w_map = {}, {}
-        try:
-            conn = sqlite3.connect(self.collector.db.db_path, timeout=15)
-            try:
-                rows = conn.execute(
-                    "SELECT ts, metric, value FROM metrics WHERE ts>=? "
-                    "AND (metric LIKE 'diskio_r:%' OR metric LIKE 'diskio_w:%') ORDER BY ts",
-                    (cutoff,),
-                ).fetchall()
-            finally:
-                conn.close()
-        except Exception:
-            rows = []
-        for ts, metric, value in rows:
-            bucket = r_map if metric.startswith("diskio_r:") else w_map
-            if ts not in bucket:
-                bucket[ts] = 0.0
-            bucket[ts] += value
-        r = sorted([(t, v) for t, v in r_map.items()])
-        w = sorted([(t, v) for t, v in w_map.items()])
+        """磁盘 IO 历史：聚合全部磁盘读/写速率（MB/s），返回 {r:[], w:[]}（SQL 内降采样）。"""
+        seconds = self._RANGE_SECONDS.get(range_, 3600)
+        db = self.collector.db
+        span = self._span(seconds)
+        mr, mw = db.metrics_with_prefix("diskio_r:"), db.metrics_with_prefix("diskio_w:")
+        bk = db.bucket_for(mr + mw, seconds)
+        r = [(t, round(v, 2)) for t, v in db.sum_series(mr, seconds, span=span, bucket=bk)]
+        w = [(t, round(v, 2)) for t, v in db.sum_series(mw, seconds, span=span, bucket=bk)]
         # 实时兜底：历史为空或最新点过旧时，附加当前实时读写速率，保证趋势图始终有数据
         now = time.time()
         latest_ts = 0.0
@@ -4707,21 +5548,8 @@ class MonitorApp:
         db = self.collector.db
         info = {"data_dir": self.data_dir, "db_file": db.db_path,
                 "db_exists": os.path.exists(db.db_path), "db_size": db.metrics_size()}
-        # 最近写入时间
         try:
-            conn = sqlite3.connect(db.db_path, timeout=5)
-            try:
-                cur = conn.execute("SELECT MAX(ts) FROM metrics")
-                row = cur.fetchone()
-                info["last_ts"] = row[0] if row and row[0] else None
-                cur = conn.execute("SELECT COUNT(*) FROM metrics")
-                row = cur.fetchone()
-                info["rows"] = row[0] if row else 0
-                cur = conn.execute("SELECT COUNT(DISTINCT metric) FROM metrics")
-                row = cur.fetchone()
-                info["metrics"] = row[0] if row else 0
-            finally:
-                conn.close()
+            info.update(db.diag())
         except Exception as e:
             info["db_error"] = str(e)
         info["snapshot_ts"] = self.collector.get_snapshot().get("ts")
@@ -4729,24 +5557,20 @@ class MonitorApp:
 
     def api_net_history(self, range_):
         """聚合所有物理网卡的上下行速率历史（排除虚拟网卡），返回 {rx:[...], tx:[...]}。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 3600)
-        rows = self.collector.db.export_net(seconds)
+        seconds = self._RANGE_SECONDS.get(range_, 3600)
+        db = self.collector.db
         virt = ("docker", "veth", "br-", "virbr", "tun", "tap", "vnet", "lxc", "kube", "lo", "wg")
-        rx = {}
-        tx = {}
-        for ts, metric, value in rows:
-            iface = metric.split(":", 1)[1] if ":" in metric else ""
-            if iface.startswith(virt):
-                continue
-            if metric.startswith("net_rx:"):
-                rx[ts] = rx.get(ts, 0) + value
-            elif metric.startswith("net_tx:"):
-                tx[ts] = tx.get(ts, 0) + value
-        def sample(d):
-            order = sorted(d)
-            step = max(1, len(order) // 720)
-            return [[t, round(d[t], 1)] for t in order[::step]]
-        return {"range": range_, "rx": sample(rx), "tx": sample(tx)}
+
+        def phys(prefix):
+            return [m for m in db.metrics_with_prefix(prefix) if not m.split(":", 1)[1].startswith(virt)]
+
+        span = self._span(seconds)
+        pr, pt = phys("net_rx:"), phys("net_tx:")
+        bk = db.bucket_for(pr + pt, seconds)
+        rx = db.sum_series(pr, seconds, span=span, bucket=bk)
+        tx = db.sum_series(pt, seconds, span=span, bucket=bk)
+        return {"range": range_, "rx": [[t, round(v, 1)] for t, v in rx],
+                "tx": [[t, round(v, 1)] for t, v in tx]}
 
     def api_system(self):
         info = system_info()
@@ -4756,79 +5580,121 @@ class MonitorApp:
         return info
 
     def api_config(self):
-        c = dict(self.config)
+        c = self._public_config()
         c["data_dir_actual"] = self.data_dir
         c["ui_file"] = os.path.join(self.data_dir, "ui.json")  # 界面同步设置文件实际位置
         c["version"] = VERSION
         c["arch"] = self.updater.detect_arch()
         c["update_status"] = self.updater.status()
-        # 鉴权状态（不回传密码明文，前端只关心开关与是否已设口令）
+        c["listen_port"] = self.port
+        # 鉴权状态（绝不回传口令或哈希，前端只关心开关与是否已设口令）
         c["auth_enabled"] = 1 if str(self.config.get("auth_enabled") or "0") in ("1", "true", "on") else 0
-        c["auth_has_password"] = bool(str(self.config.get("auth_password") or "").strip())
         c["auth_session_days"] = int(self.config.get("auth_session_days") or 7)
+        c["password_min_len"] = PASSWORD_MIN_LEN
         return {"config": c}
 
     # ------------------------------------------------------------------
     # 登录鉴权：会话管理 + 口令登录 / 初始化 / 登出
+    # 会话文件 sessions.json 固定放在配置目录（不随自定义数据目录进入共享文件夹），
+    # 权限 0600，只保存 sha256(sid)，文件泄露也无法直接冒用会话。
     # ------------------------------------------------------------------
     def _sessions_path(self):
-        return os.path.join(self.data_dir, "sessions.json")
+        return os.path.join(self._cfg_dir, "sessions.json")
+
+    @staticmethod
+    def _sid_key(sid):
+        return hashlib.sha256(str(sid).encode("utf-8")).hexdigest()
 
     def _load_sessions(self):
-        """从磁盘加载会话表，并清理已过期的会话。"""
-        try:
-            with open(self._sessions_path(), "r", errors="ignore") as f:
-                self._sessions = json.load(f)
-        except Exception:
-            self._sessions = {}
+        """从磁盘加载会话表（兼容旧版明文 sid 键与旧位置 data_dir/sessions.json），清理过期会话。"""
+        sessions, migrated = {}, False
+        paths = [self._sessions_path()]
+        legacy = os.path.join(self.data_dir, "sessions.json")
+        if os.path.abspath(legacy) != os.path.abspath(paths[0]):
+            paths.append(legacy)
+        for p in paths:
+            try:
+                with open(p, "r", errors="ignore") as f:
+                    raw = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            for k, v in raw.items():
+                if not isinstance(v, dict):
+                    continue
+                if v.get("h") == 1:
+                    sessions[k] = v
+                else:                       # 旧版：键为明文 sid → 转为哈希键
+                    v = dict(v, h=1)
+                    sessions[self._sid_key(k)] = v
+                    migrated = True
+            if p != paths[0]:
+                migrated = True
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
         now = time.time()
-        expired = [sid for sid, s in self._sessions.items()
-                   if float(s.get("expires") or 0) < now]
-        if expired:
-            for sid in expired:
-                self._sessions.pop(sid, None)
+        expired = [k for k, s in sessions.items() if float(s.get("expires") or 0) < now]
+        for k in expired:
+            sessions.pop(k, None)
+        with self._sessions_lock:
+            self._sessions = sessions
+        if expired or migrated:
             self._save_sessions()
 
     def _save_sessions(self):
-        """原子写入会话表（临时文件 + os.replace，避免并发写坏）。"""
-        path = self._sessions_path()
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._sessions, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, path)
-        except Exception:
-            pass
+        """原子写入会话表（0600，临时文件 + os.replace；加锁避免并发迭代 / 写坏）。"""
+        with self._sessions_lock:
+            snap = dict(self._sessions)
+            try:
+                write_json_secure(self._sessions_path(), snap)
+            except Exception:
+                traceback.print_exc()
 
     def _create_session(self, user, via):
         """创建会话，返回 (sid, max_age_seconds)。"""
         days = max(1, min(365, int(self.config.get("auth_session_days") or 7)))
         max_age = days * 86400
-        sid = hashlib.sha256(os.urandom(24)).hexdigest()
+        sid = hashlib.sha256(os.urandom(32)).hexdigest()
         now = time.time()
-        self._sessions[sid] = {"user": user, "via": via,
-                              "created": now, "expires": now + max_age}
+        with self._sessions_lock:
+            self._sessions[self._sid_key(sid)] = {"user": user, "via": via, "h": 1,
+                                                  "created": now, "expires": now + max_age}
         self._save_sessions()
         return sid, max_age
 
     def _check_session(self, sid):
         """校验会话有效性，返回 True/False；过期会话自动清理。"""
-        if not sid:
+        if not sid or len(sid) > 128:
             return False
-        s = self._sessions.get(sid)
+        key = self._sid_key(sid)
+        with self._sessions_lock:
+            s = self._sessions.get(key)
         if not s:
             return False
         if float(s.get("expires") or 0) < time.time():
-            self._sessions.pop(sid, None)
+            with self._sessions_lock:
+                self._sessions.pop(key, None)
             self._save_sessions()
             return False
         return True
+
+    def _revoke_other_sessions(self, keep_sid=None):
+        keep = self._sid_key(keep_sid) if keep_sid else None
+        with self._sessions_lock:
+            self._sessions = {k: v for k, v in self._sessions.items() if k == keep}
+        self._save_sessions()
+
+    def _has_password(self):
+        return bool(str(self.config.get("auth_password_hash") or "").strip())
 
     def _auth_required(self):
         """是否需要鉴权：auth_enabled=1 且已设口令时才启用。"""
         if str(self.config.get("auth_enabled") or "0") not in ("1", "true", "on"):
             return False
-        return bool(str(self.config.get("auth_password") or "").strip())
+        return self._has_password()
 
     def _get_cookie_sid(self, headers):
         """从 Cookie 头解析 fnmp_sid 值。"""
@@ -4843,8 +5709,7 @@ class MonitorApp:
         """鉴权检查：返回 True=已登录或无需鉴权。"""
         if not self._auth_required():
             return True
-        sid = self._get_cookie_sid(headers)
-        return self._check_session(sid)
+        return self._check_session(self._get_cookie_sid(headers))
 
     def api_auth_session(self, headers):
         """查询当前登录态。"""
@@ -4852,71 +5717,97 @@ class MonitorApp:
             return {"ok": True, "logged_in": True, "auth_required": False}
         sid = self._get_cookie_sid(headers)
         if self._check_session(sid):
-            s = self._sessions.get(sid, {})
+            with self._sessions_lock:
+                s = dict(self._sessions.get(self._sid_key(sid), {}))
             return {"ok": True, "logged_in": True, "auth_required": True,
                     "user": s.get("user", ""), "via": s.get("via", "")}
         return {"ok": True, "logged_in": False, "auth_required": True}
 
     def api_auth_config(self):
         """返回鉴权配置（供登录页判断模式）。"""
-        pw = str(self.config.get("auth_password") or "").strip()
+        has = self._has_password()
         return {"auth_enabled": 1 if str(self.config.get("auth_enabled") or "0") in ("1", "true", "on") else 0,
-                "requires_password": bool(pw),
-                "setup_mode": not bool(pw)}
+                "requires_password": has, "setup_mode": not has, "password_min_len": PASSWORD_MIN_LEN}
 
-    def api_auth_password(self, data, headers=None):
-        """口令登录：校验密码 → 建会话 → 返回 sid/max_age 供 Handler 写 Cookie。"""
-        pw = str(self.config.get("auth_password") or "").strip()
-        if not pw:
-            return {"ok": False, "error": "未配置登录口令"}, None, 0
+    def _verify_with_limit(self, pw, ip):
+        """口令校验（共用失败限速）。返回 True / False。"""
+        with self.limiter.verify_sem:
+            ok = verify_password(pw, self.config.get("auth_password_hash"))
+        if ok:
+            self.limiter.success(ip)
+        else:
+            self.limiter.fail(ip)
+        return ok
+
+    def api_auth_password(self, data, ip=""):
+        """口令登录：校验 → 建会话。返回 (响应, cookie)。限速在 Handler 中先行检查。"""
+        if not self._has_password():
+            return {"ok": False, "error": "未配置登录口令"}, None
         inp = str((data or {}).get("password") or "")
-        if inp != pw:
-            return {"ok": False, "error": "口令错误"}, None, 0
+        if not inp or len(inp) > 256 or not self._verify_with_limit(inp, ip):
+            print("[fnmonitor] 登录失败（来源 %s）" % ip)
+            resp = {"ok": False, "error": "口令错误"}
+            wait = self.limiter.retry_after(ip)
+            if wait:
+                resp["retry_after"] = wait
+            return resp, None
+        print("[fnmonitor] 登录成功（来源 %s）" % ip)
         sid, ma = self._create_session("(登录口令)", "password")
-        return {"ok": True}, sid, ma
+        return {"ok": True}, (sid, ma)
 
-    def api_auth_setup(self, data):
-        """首次初始化口令：仅在未设口令时可用，口令 >= 4 位。"""
-        pw = str(self.config.get("auth_password") or "").strip()
-        if pw:
-            return {"ok": False, "error": "已设置口令，请使用登录修改"}
-        inp = str((data or {}).get("password") or "").strip()
-        if len(inp) < 4:
-            return {"ok": False, "error": "口令至少 4 位"}
-        self.config["auth_password"] = inp
-        self.config["auth_enabled"] = 1
-        # 写入 config.json 持久化
-        try:
-            path = os.path.join(self._cfg_dir, "config.json")
-            cur = {}
+    def _update_config_file(self, updates, remove=()):
+        """读改写 config.json（加锁 + 0600 原子写），并清除遗留明文口令。返回写入后的内容。"""
+        path = os.path.join(self._cfg_dir, "config.json")
+        with _CFG_WRITE_LOCK:
             try:
                 with open(path, "r", errors="ignore") as f:
                     cur = json.load(f)
+                if not isinstance(cur, dict):
+                    cur = {}
             except Exception:
-                pass
-            cur["auth_password"] = inp
-            cur["auth_enabled"] = 1
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cur, f, ensure_ascii=False, indent=1)
-        except Exception:
-            pass
+                cur = {}
+            cur.update(updates)
+            for k in tuple(remove) + ("auth_password",):
+                cur.pop(k, None)
+            write_json_secure(path, cur)
+        return cur
+
+    def api_auth_setup(self, data, ip=""):
+        """首次初始化口令：仅在未设口令时可用（口令 ≥ PASSWORD_MIN_LEN 位），设置后启用登录保护。"""
+        inp = str((data or {}).get("password") or "")
+        if len(inp) < PASSWORD_MIN_LEN or len(inp) > 256:
+            return {"ok": False, "error": "口令至少 %d 位" % PASSWORD_MIN_LEN}, None
+        with _CFG_WRITE_LOCK:
+            if self._has_password():
+                return {"ok": False, "error": "已设置口令，请使用登录修改"}, None
+            h = hash_password(inp)
+            try:
+                self._update_config_file({"auth_password_hash": h, "auth_enabled": 1})
+            except Exception as e:
+                return {"ok": False, "error": "保存失败: %s" % e}, None
+            self.config["auth_password_hash"] = h
+            self.config["auth_enabled"] = 1
+            self._overview_bytes = b""
+        print("[fnmonitor] 已通过 /api/auth/setup 初始化登录口令并启用登录保护（来源 %s）" % ip)
+        self._revoke_other_sessions()
         sid, ma = self._create_session("(初始化)", "setup")
-        return {"ok": True}, sid, ma
+        return {"ok": True}, (sid, ma)
 
     def api_auth_logout(self, headers):
         """登出：删会话 + 清 Cookie。"""
         sid = self._get_cookie_sid(headers)
-        if sid and sid in self._sessions:
-            self._sessions.pop(sid, None)
-            self._save_sessions()
+        if sid:
+            with self._sessions_lock:
+                removed = self._sessions.pop(self._sid_key(sid), None)
+            if removed:
+                self._save_sessions()
         return {"ok": True}
-
 
     def api_update_check(self, force=False):
         return self.updater.check(force=force)
 
     def api_update_download_nas(self, dest_dir=None):
-        """下载当前线上最新版安装包到 NAS 指定目录（不比较版本，始终可下载）。"""
+        """下载当前线上最新版安装包到 NAS 指定目录（不比较版本；必须通过官方 SHA256 校验）。"""
         info = self.updater.check()  # 走缓存，已有结果不重复请求
         if not info.get("ok"):
             return {"ok": False, "error": info.get("error") or "检查更新失败"}
@@ -4925,26 +5816,14 @@ class MonitorApp:
             return {"ok": False, "error": "Release 中未找到 %s 平台安装包" % info.get("arch")}
         ok, path = self.updater.download_to_nas(asset, dest_dir=dest_dir)
         if ok:
-            note = "已保存到 NAS，可在飞牛文件管理中查看；也可在应用中心「手动安装」选择该文件完成升级"
+            note = "已保存到 NAS（SHA256 已校验），可在飞牛文件管理中查看；也可在应用中心「手动安装」选择该文件完成升级"
             return {"ok": True, "file": os.path.basename(path), "path": path,
-                    "latest": info.get("latest"), "note": note}
+                    "latest": info.get("latest"), "sha256": asset.get("digest"), "note": note}
         return {"ok": False, "error": path}
 
     def api_update_install(self):
-        """在线更新：下载最新版安装包（缓存复用）→ 校验 → 覆盖安装 → 自动重启服务。"""
-        info = self.updater.check()
-        if not info.get("ok"):
-            return {"ok": False, "error": info.get("error") or "检查更新失败"}
-        asset = info.get("asset")
-        if not asset:
-            return {"ok": False, "error": "Release 中未找到 %s 平台安装包" % info.get("arch")}
-        ok, fpk = self.updater.download_to_nas(asset)
-        if not ok:
-            return {"ok": False, "error": "下载失败: %s" % fpk}
-        ok, msg = self.updater.install_fpk(fpk)
-        if ok:
-            return {"ok": True, "note": msg, "version": info.get("latest")}
-        return {"ok": False, "error": msg}
+        """在线更新：检查 → 下载并校验 SHA256 → 安全解包覆盖 → 自动重启服务（互斥，拒绝降级）。"""
+        return self.updater.install_latest()
 
     def api_update_asset(self):
         """返回当前架构最新安装包资产信息（供浏览器代理下载）。"""
@@ -4957,8 +5836,9 @@ class MonitorApp:
         return asset, None
 
     def api_apps(self, refresh=False):
-        if refresh:
-            # 用户手动点击"更新"：绕过缓存，立即重新扫描内置应用并同步到最新快照
+        # 手动刷新：重新扫描内置应用（目录遍历 + 数据库 COUNT 为重操作，60 秒冷却防止被刷）
+        if refresh and time.time() - self._apps_refresh_ts >= 60:
+            self._apps_refresh_ts = time.time()
             try:
                 self.collector._last_apps = collect_app_stats()
                 self.collector._last_apps_ts = time.time()
@@ -4997,9 +5877,19 @@ class MonitorApp:
         clean = {}
         # 注意：layoutVersion / tab 必须一并持久化，否则前端 loadUI 会因
         # 服务器端 layoutVersion 恒为 0 < 本地版本而每次刷新重置布局
-        for k in ("theme", "layoutVersion", "panelOrder", "hiddenPanels", "hiddenMods", "range", "tab", "sideCollapsed", "fontScale"):
+        # v2.18 新界面：主色 / 点阵数字 / 动效 / 分区布局与显示 / 提醒阈值；旧字段保留以兼容回退
+        for k in ("theme", "layoutVersion", "panelOrder", "hiddenPanels", "hiddenMods", "range", "tab", "sideCollapsed", "fontScale",
+                  "accent", "dotMatrix", "motion", "layout", "hidden"):
             if k in data:
                 clean[k] = data[k]
+        if "thresholds" in data:
+            clean["thresholds"] = sanitize_thresholds(data.get("thresholds"))
+        # 主色只接受十六进制颜色或简单的主题色名（防止值被拼进 style / HTML 形成注入）
+        if "accent" in clean and not re.match(r"^(#[0-9a-fA-F]{3,8}|[A-Za-z0-9_-]{1,32})$", str(clean["accent"])):
+            clean.pop("accent", None)
+        # 防止异常客户端写入超大配置（正常 ui.json 只有几 KB）
+        if len(json.dumps(clean, ensure_ascii=False)) > 256 * 1024:
+            return {"ok": False, "error": "ui config too large"}
         path = self._ui_config_path()
         try:
             try:
@@ -5017,158 +5907,175 @@ class MonitorApp:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def api_config_save(self, data):
-        """保存配置（采集间隔/保留天数/服务端口/数据目录），端口修改需重启应用后生效。"""
-        path = os.path.join(self._cfg_dir, "config.json")
-        try:
-            with open(path, "r", errors="ignore") as f:
-                cur = json.load(f)
-        except Exception:
-            cur = {}
+    def api_config_save(self, data, headers=None, ip=""):
+        """保存配置（采集间隔/保留天数/服务端口/数据目录/口令…），端口修改需重启应用后生效。
+
+        返回 (响应, HTTP 状态码, cookie)。口令修改规则：
+        - 已设口令时必须提供 old_password 且校验通过，否则 403 {"error":"old_password_invalid"}
+          （校验失败计入登录限速，锁定期间返回 429 + retry_after）；
+        - 首次设置只需 auth_password；新口令至少 PASSWORD_MIN_LEN 位；
+        - 修改成功后吊销其他所有会话，保留当前请求的会话。
+        所有校验在写文件前完成，任一失败则整个保存不生效。"""
+        headers = headers or {}
+        caller_sid = self._get_cookie_sid(headers) if hasattr(headers, "get") else ""
+        caller_valid = bool(caller_sid) and self._check_session(caller_sid)
+        had_password = self._has_password()
+        updates, remove = {}, []
         changed_port = False
-        for k in ("interval", "retention_days", "port", "history_interval"):
+
+        # ---- 口令（先校验，失败直接返回） ----
+        new_hash = None
+        if "auth_password" in data:
+            pw = str(data.get("auth_password") or "")
+            if pw:  # 空字符串=不改密码
+                if len(pw) < PASSWORD_MIN_LEN or len(pw) > 256:
+                    return {"ok": False, "error": "口令至少 %d 位" % PASSWORD_MIN_LEN}, 200, None
+                if self._has_password():
+                    wait = self.limiter.retry_after(ip)
+                    if wait:
+                        return {"ok": False, "error": "尝试次数过多，请 %d 秒后再试" % wait,
+                                "retry_after": wait}, 429, None
+                    old = str(data.get("old_password") or "")
+                    if not old or len(old) > 256 or not self._verify_with_limit(old, ip):
+                        print("[fnmonitor] 修改口令失败：当前口令校验未通过（来源 %s）" % ip)
+                        return {"ok": False, "error": "old_password_invalid",
+                                "message": "当前口令不正确"}, 403, None
+                new_hash = hash_password(pw)
+                updates["auth_password_hash"] = new_hash
+
+        # ---- 端口：1024–65535（0 = 恢复默认端口），且不能被其他进程占用 ----
+        if "port" in data:
+            try:
+                v = int(data["port"])
+            except Exception:
+                return {"ok": False, "error": "端口须为整数"}, 200, None
+            if v != 0 and not (1024 <= v <= 65535):
+                return {"ok": False, "error": "端口须在 1024–65535 之间（0 表示恢复默认端口）"}, 200, None
+            if v != 0 and v != self.port and not port_available(v):
+                return {"ok": False, "error": "端口 %d 已被其他程序占用，请换一个端口" % v}, 200, None
+            cur_port = int(self.config.get("port") or 0)
+            if cur_port != v:
+                changed_port = True
+            updates["port"] = v
+
+        for k in ("interval", "retention_days", "history_interval"):
             if k in data:
                 try:
                     v = int(data[k])
-                    if k == "interval":
-                        v = max(2, min(v, 3600))
-                    elif k == "retention_days":
-                        v = max(1, min(v, 365))
-                    elif k == "port":
-                        v = 0 if v <= 0 else v
-                        if cur.get("port", 0) != v:
-                            changed_port = True
-                    elif k == "history_interval":
-                        v = max(60, min(v, 86400))
-                    cur[k] = v
                 except Exception:
-                    pass
+                    continue
+                if k == "interval":
+                    v = max(2, min(v, 3600))
+                elif k == "retention_days":
+                    v = max(1, min(v, 365))
+                else:
+                    v = max(60, min(v, 86400))
+                updates[k] = v
         if "weather_city" in data:
-            cur["weather_city"] = str(data["weather_city"])[:200]
+            updates["weather_city"] = clean_text(data.get("weather_city"), 64)
             self._weather_cache = None  # 位置变化后清缓存
-        for k in ("update_autocheck", "update_autodownload", "update_autoupdate"):
+        onoff = lambda x: 1 if str(x).lower() in ("1", "true", "on") else 0
+        for k in ("update_autocheck", "update_autodownload", "update_autoupdate", "traffic_exclude_bridge",
+                  "disk_standby_protect", "monthly_summary_enabled", "auth_enabled", "ec_fan_probe"):
             if k in data:
-                cur[k] = 1 if str(data[k]) in ("1", "true", "on") else 0
-        # 流量与功耗配置
-        for k in ("traffic_exclude_bridge",):
-            if k in data:
-                cur[k] = 1 if str(data[k]) in ("1", "true", "on") else 0
+                updates[k] = onoff(data[k])
         for k in ("power_tdp_w", "power_disk_typical_w", "power_nic_fixed_w",
                   "power_rate_yuan", "power_base_w"):
             if k in data:
                 try:
-                    cur[k] = max(0.0, min(500.0, float(data[k])))
+                    fv = float(data[k])
+                    if math.isfinite(fv):
+                        updates[k] = max(0.0, min(500.0, fv))
                 except Exception:
                     pass
-        # 硬盘休眠保护开关
-        if "disk_standby_protect" in data:
-            cur["disk_standby_protect"] = 1 if str(data["disk_standby_protect"]) in ("1", "true", "on") else 0
-        # 上月汇总开关
-        if "monthly_summary_enabled" in data:
-            cur["monthly_summary_enabled"] = 1 if str(data["monthly_summary_enabled"]) in ("1", "true", "on") else 0
         if "data_dir" in data:
-            nd = str(data["data_dir"]).strip()
-            if nd and os.path.isabs(nd):
-                cur["data_dir"] = nd
+            nd = str(data.get("data_dir") or "").strip()
+            if nd:
+                ok_dir, why = validate_data_dir(nd)
+                if not ok_dir:
+                    return {"ok": False, "error": why}, 200, None
+                updates["data_dir"] = os.path.normpath(nd)
             else:
-                cur.pop("data_dir", None)
+                remove.append("data_dir")
         # 飞牛桌面打开方式：iframe=点击图标在飞牛窗口内打开 / url=点击图标直接在
         # 浏览器新标签页打开。保存到 config.json；同时写入桌面入口 ui/config 的
-        # type 并重启应用中心，使 fnOS 桌面按新模式打开（刷新桌面页后生效）
+        # type 并同步应用中心数据库，使 fnOS 桌面按新模式打开（刷新桌面页后生效）
         if "open_mode" in data:
             m = str(data["open_mode"]).lower()
             if m in ("iframe", "url"):
-                cur["open_mode"] = m
-        # 登录口令：开关 / 修改密码 / 会话有效期（设置页提交）
-        if "auth_enabled" in data:
-            cur["auth_enabled"] = 1 if str(data["auth_enabled"]) in ("1", "true", "on") else 0
-        if "auth_password" in data:
-            pw = str(data["auth_password"])
-            if pw:  # 空字符串=不改密码
-                cur["auth_password"] = pw
+                updates["open_mode"] = m
         if "auth_session_days" in data:
             try:
-                cur["auth_session_days"] = max(1, min(365, int(data["auth_session_days"])))
+                updates["auth_session_days"] = max(1, min(365, int(data["auth_session_days"])))
             except Exception:
                 pass
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cur, f, ensure_ascii=False, indent=1)
-            if "interval" in cur:
-                self.config["interval"] = max(2, int(cur["interval"]))
-            if "retention_days" in cur:
-                self.config["retention_days"] = max(1, int(cur["retention_days"]))
-            if "history_interval" in cur:
-                self.config["history_interval"] = max(60, int(cur["history_interval"]))
-            if "weather_city" in cur:
-                self.config["weather_city"] = str(cur["weather_city"])
-            for k in ("update_autocheck", "update_autodownload", "update_autoupdate"):
-                if k in cur:
-                    self.config[k] = 1 if str(cur[k]) in ("1", "true", "on") else 0
-            # 流量与功耗配置同步到内存
-            for k in ("traffic_exclude_bridge", "disk_standby_protect", "monthly_summary_enabled"):
-                if k in cur:
-                    self.config[k] = 1 if str(cur[k]) in ("1", "true", "on") else 0
-            for k in ("power_tdp_w", "power_disk_typical_w", "power_nic_fixed_w",
-                      "power_rate_yuan", "power_base_w"):
-                if k in cur:
-                    try:
-                        self.config[k] = float(cur[k])
-                    except Exception:
-                        pass
-            if "data_dir" in cur:
-                self.config["data_dir"] = str(cur["data_dir"]).strip()
-            open_mode_changed = False
-            new_mode = str(cur.get("open_mode", "")).lower()
-            if new_mode in ("iframe", "url"):
-                open_mode_changed = (str(self.config.get("open_mode") or "") != new_mode)
-                self.config["open_mode"] = new_mode
-            # 登录口令配置同步到内存即时生效
-            if "auth_enabled" in cur:
-                self.config["auth_enabled"] = 1 if str(cur["auth_enabled"]) in ("1", "true", "on") else 0
-            if "auth_password" in cur:
-                self.config["auth_password"] = str(cur["auth_password"])
-            if "auth_session_days" in cur:
-                try:
-                    self.config["auth_session_days"] = max(1, min(365, int(cur["auth_session_days"])))
-                except Exception:
-                    pass
-            # 桌面入口同步：端口变更同步 port；打开方式变更同步 type。除写 ui/config
-            # 文件外，apply_launcher_entry 内部还会同步 fnOS 应用中心数据库（真机
-            # 实证桌面点击行为由数据库决定）——刷新飞牛桌面页（F5）后点击桌面图标
-            # 即按新模式打开（url=直接开浏览器标签页，不再弹出内嵌窗口），无需重启
-            # 任何系统服务。结果记入日志并随保存提示返回，真机上可直接确认生效情况
-            launcher_ok, launcher_msg = True, ""
-            if changed_port:
-                try:
-                    ok_p, msg_p = apply_launcher_entry(port=int(cur.get("port") or 0))
-                    print("[fnmonitor] 桌面入口端口同步: %s" % msg_p)
-                except Exception as e:
-                    print("[fnmonitor] 桌面入口端口同步异常: %s" % e)
-            if new_mode in ("iframe", "url"):
-                try:
-                    launcher_ok, launcher_msg = apply_launcher_entry(mode=new_mode, port=int(cur.get("port") or 0))
-                except Exception as e:
-                    launcher_ok, launcher_msg = False, str(e)
-                print("[fnmonitor] 桌面入口配置: %s" % launcher_msg)
-            self.collector._cfg_mtime = 0.0  # 强制采集线程下次重载
-            note_parts = []
-            if changed_port:
-                note_parts.append("端口修改需在应用中心重启「飞牛监控」后生效")
-            if open_mode_changed:
-                note_parts.append("打开方式已切换，刷新飞牛桌面页面（F5）或重新登录后，点击桌面图标将直接按「%s」打开"
-                                  % ("飞牛窗口" if new_mode == "iframe" else "浏览器新标签页"))
-                if launcher_ok:
-                    if launcher_msg:
-                        note_parts.append(launcher_msg)
-                else:
-                    note_parts.append("桌面入口同步失败: %s" % launcher_msg)
-            return {"ok": True, "config": dict(self.config), "port_changed": changed_port,
-                    "open_mode_changed": open_mode_changed,
-                    "launcher_ok": launcher_ok, "launcher_msg": launcher_msg,
-                    "note": "；".join(note_parts)}
+            cur = self._update_config_file(updates, remove)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e)}, 200, None
+
+        # ---- 同步到内存，即时生效 ----
+        for k, v in updates.items():
+            if k == "interval":
+                self.config[k] = max(2, int(v))
+            elif k == "retention_days":
+                self.config[k] = max(1, int(v))
+            elif k == "history_interval":
+                self.config[k] = max(60, int(v))
+            elif k not in ("open_mode",):
+                self.config[k] = v
+        for k in remove:
+            self.config[k] = ""
+        self._overview_bytes = b""
+        open_mode_changed = False
+        new_mode = str(updates.get("open_mode", "")).lower()
+        if new_mode in ("iframe", "url"):
+            open_mode_changed = (str(self.config.get("open_mode") or "") != new_mode)
+            self.config["open_mode"] = new_mode
+
+        # ---- 会话：改口令后吊销其他会话；保存后需要登录而调用方没有有效会话时补发一个 ----
+        cookie = None
+        if new_hash:
+            print("[fnmonitor] 登录口令已%s（来源 %s），已吊销其他会话"
+                  % ("修改" if had_password else "设置", ip))
+            self._revoke_other_sessions(caller_sid if caller_valid else None)
+        if self._auth_required() and not caller_valid:
+            sid, ma = self._create_session("(设置页)", "config")
+            cookie = (sid, ma)
+
+        # 桌面入口同步：端口变更同步 port；打开方式变更同步 type。除写 ui/config
+        # 文件外，apply_launcher_entry 内部还会同步 fnOS 应用中心数据库（真机
+        # 实证桌面点击行为由数据库决定）——刷新飞牛桌面页（F5）后点击桌面图标
+        # 即按新模式打开，无需重启任何系统服务。
+        launcher_ok, launcher_msg = True, ""
+        if changed_port:
+            try:
+                ok_p, msg_p = apply_launcher_entry(port=int(cur.get("port") or 0))
+                print("[fnmonitor] 桌面入口端口同步: %s" % msg_p)
+            except Exception as e:
+                print("[fnmonitor] 桌面入口端口同步异常: %s" % e)
+        if new_mode in ("iframe", "url"):
+            try:
+                launcher_ok, launcher_msg = apply_launcher_entry(mode=new_mode, port=int(cur.get("port") or 0))
+            except Exception as e:
+                launcher_ok, launcher_msg = False, str(e)
+            print("[fnmonitor] 桌面入口配置: %s" % launcher_msg)
+        self.collector._cfg_mtime = 0.0  # 强制采集线程下次重载
+        note_parts = []
+        if changed_port:
+            note_parts.append("端口修改需在应用中心重启「飞牛监控」后生效")
+        if open_mode_changed:
+            note_parts.append("打开方式已切换，刷新飞牛桌面页面（F5）或重新登录后，点击桌面图标将直接按「%s」打开"
+                              % ("飞牛窗口" if new_mode == "iframe" else "浏览器新标签页"))
+            if launcher_ok:
+                if launcher_msg:
+                    note_parts.append(launcher_msg)
+            else:
+                note_parts.append("桌面入口同步失败: %s" % launcher_msg)
+        return {"ok": True, "config": self._public_config(), "port_changed": changed_port,
+                "open_mode_changed": open_mode_changed, "password_changed": bool(new_hash),
+                "launcher_ok": launcher_ok, "launcher_msg": launcher_msg,
+                "note": "；".join(note_parts)}, 200, cookie
 
     def api_sensors(self):
         return self.collector.get_snapshot().get("sensors", {"temps": [], "fans": [], "volts": [], "available": False, "fans_source": ""})
@@ -5206,24 +6113,19 @@ class MonitorApp:
         today_sec = now - today_start
         month_sec = now - month_start
         def _period_totals(prefix, seconds):
-            rows = self.collector.db.query_prefix(prefix, seconds)
-            if not rows:
-                return 0
-            by_iface = {}
-            for ts, metric, value in rows:
+            # 每个网卡只取区间首尾两行（索引 seek），不再把整月累计字节行读进 Python
+            db = self.collector.db
+            cutoff = now - seconds
+            total = 0.0
+            for metric in db.metrics_with_prefix(prefix):
                 iface = metric.split(":", 1)[1] if ":" in metric else metric
-                if iface not in by_iface:
-                    by_iface[iface] = []
-                by_iface[iface].append((ts, value))
-            total = 0
-            for iface, pts in by_iface.items():
                 if exclude_bridge and iface.startswith(virt_prefixes):
                     continue
                 if iface == "lo":
                     continue
-                earliest = pts[0][1]
-                latest = pts[-1][1]
-                total += max(0, latest - earliest)
+                fl = db.first_last(metric, cutoff)
+                if fl:
+                    total += max(0, fl[1] - fl[0])
             return total
         today_rx = _period_totals("net_rx_bytes:", today_sec)
         today_tx = _period_totals("net_tx_bytes:", today_sec)
@@ -5278,17 +6180,8 @@ class MonitorApp:
         today_sec = now - today_start
         month_sec = now - month_start
         def _kwh_from_history(seconds):
-            rows = self.collector.db.query("power", seconds)
-            if not rows:
-                return 0.0
-            # 用样本间隔中位数积分
-            if len(rows) < 2:
-                return round(rows[0][1] * hist_interval / 3_600_000, 4)
-            dts = [rows[i+1][0] - rows[i][0] for i in range(len(rows)-1)]
-            dts.sort()
-            median_dt = dts[len(dts)//2] if dts else hist_interval
-            total_j = sum(v * median_dt for _, v in rows)
-            return round(total_j / 3_600_000, 4)
+            # SQL 聚合整个区间（旧版受 query 默认 LIMIT 7200 限制，月初 5 天后本月 kWh 偏低）
+            return self.collector.db.energy_kwh("power", seconds, default_dt=hist_interval)
         today_kwh = _kwh_from_history(today_sec)
         month_kwh = _kwh_from_history(month_sec)
         # 开机累计估算
@@ -5328,87 +6221,102 @@ class MonitorApp:
         return result
 
     def api_net_bytes_history(self, range_):
-        """各网卡累计字节时间序列（聚合 net_rx_bytes:* / net_tx_bytes:*）。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 3600)
-        rows_rx = self.collector.db.query_prefix("net_rx_bytes:", seconds)
-        rows_tx = self.collector.db.query_prefix("net_tx_bytes:", seconds)
-        # 按时间戳聚合所有网卡的总字节
-        rx_map = {}
-        for ts, metric, value in rows_rx:
-            rx_map[ts] = rx_map.get(ts, 0) + value
-        tx_map = {}
-        for ts, metric, value in rows_tx:
-            tx_map[ts] = tx_map.get(ts, 0) + value
-        all_ts = sorted(set(rx_map.keys()) | set(tx_map.keys()))
-        step = max(1, len(all_ts) // 720)
-        sampled = all_ts[::step]
-        return {"rx": [[t, rx_map.get(t, 0)] for t in sampled],
-                "tx": [[t, tx_map.get(t, 0)] for t in sampled]}
+        """各网卡累计字节时间序列（聚合 net_rx_bytes:* / net_tx_bytes:*，SQL 内降采样）。"""
+        seconds = self._RANGE_SECONDS.get(range_, 3600)
+        db = self.collector.db
+        span = self._span(seconds)
+        mr, mt = db.metrics_with_prefix("net_rx_bytes:"), db.metrics_with_prefix("net_tx_bytes:")
+        bk = db.bucket_for(mr + mt, seconds)
+        rx = db.sum_series(mr, seconds, span=span, bucket=bk)
+        tx = db.sum_series(mt, seconds, span=span, bucket=bk)
+        return self._merge_pair(rx, tx, "rx", "tx")
+
+    @staticmethod
+    def _merge_pair(a, b, ka, kb):
+        """两条序列按时间戳对齐（缺失补 0），与旧版输出格式一致。"""
+        am, bm = dict(a), dict(b)
+        order = sorted(set(am) | set(bm))
+        return {ka: [[t, round(am.get(t, 0), 1)] for t in order],
+                kb: [[t, round(bm.get(t, 0), 1)] for t in order]}
 
     def api_ctr_history(self, range_):
-        """容器累计流量时间序列（聚合 ctr_in:* / ctr_out:*）。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 3600)
-        rows_in = self.collector.db.query_prefix("ctr_in:", seconds)
-        rows_out = self.collector.db.query_prefix("ctr_out:", seconds)
-        in_map = {}
-        for ts, metric, value in rows_in:
-            in_map[ts] = in_map.get(ts, 0) + value
-        out_map = {}
-        for ts, metric, value in rows_out:
-            out_map[ts] = out_map.get(ts, 0) + value
-        all_ts = sorted(set(in_map.keys()) | set(out_map.keys()))
-        step = max(1, len(all_ts) // 720)
-        sampled = all_ts[::step]
-        return {"points": [[t, in_map.get(t, 0)] for t in sampled],
-                "out": [[t, out_map.get(t, 0)] for t in sampled]}
+        """容器累计流量时间序列（聚合 ctr_in:* / ctr_out:*，SQL 内降采样）。"""
+        seconds = self._RANGE_SECONDS.get(range_, 3600)
+        db = self.collector.db
+        span = self._span(seconds)
+        mi, mo = db.metrics_with_prefix("ctr_in:"), db.metrics_with_prefix("ctr_out:")
+        bk = db.bucket_for(mi + mo, seconds)
+        ci = db.sum_series(mi, seconds, span=span, bucket=bk)
+        co = db.sum_series(mo, seconds, span=span, bucket=bk)
+        return self._merge_pair(ci, co, "points", "out")
 
-    def api_traffic_csv(self, range_):
-        """导出流量统计 CSV。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 604800)
-        rows = self.collector.db.query_prefix("net_", seconds)
-        ctr_rows = self.collector.db.query_prefix("ctr_", seconds)
-        by_ts = {}
-        metrics = []
-        for ts, metric, value in rows + ctr_rows:
-            if metric not in metrics:
-                metrics.append(metric)
-            if ts not in by_ts:
-                by_ts[ts] = {}
-            by_ts[ts][metric] = value
-        if not by_ts:
-            buf = io.StringIO()
-            w = csv.writer(buf)
-            w.writerow(["说明", "流量历史库暂无采样数据"])
-            return ("\ufeff" + buf.getvalue()).encode("utf-8")
-        order = sorted(by_ts.keys())
+    @staticmethod
+    def _csv_line(row):
         buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["时间(本地)", "unix_ts"] + metrics)
-        for ts in order:
-            row = by_ts[ts]
-            try:
-                iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-            except Exception:
-                iso = str(ts)
-            w.writerow([iso, "%.3f" % ts] + [row.get(m, "") for m in metrics])
-        return ("\ufeff" + buf.getvalue()).encode("utf-8")
+        csv.writer(buf).writerow(row)
+        return buf.getvalue().encode("utf-8")
 
-    def api_power_csv(self, range_):
-        """导出功耗统计 CSV。"""
-        seconds = {"10m": 600, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 604800)
-        rows_power = self.collector.db.query("power", seconds)
-        rows_est = self.collector.db.query("power_est", seconds)
-        est_map = {ts: v for ts, v in rows_est}
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["时间(本地)", "unix_ts", "功耗(W)", "估算功耗(W)"])
-        for ts, v in rows_power:
+    @staticmethod
+    def _iso(ts):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except Exception:
+            return str(ts)
+
+    def _iter_wide_csv(self, seconds, cols, rows, empty_lines):
+        """宽表 CSV 生成器：rows 为按 ts 排序的 (ts, metric, value) 迭代器，逐时刻输出一行。"""
+        if not cols:
+            yield "\ufeff".encode("utf-8")
+            for line in empty_lines:
+                yield self._csv_line(line)
+            return
+        yield "\ufeff".encode("utf-8")   # 加 BOM，Excel/WPS 直接打开不乱码
+        yield self._csv_line(["时间(本地)", "unix_ts"] + cols)
+        cur_ts, cur = None, {}
+        for ts, metric, value in rows:
             try:
-                iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                ts = float(ts)
+                value = float(value)
+                if not math.isfinite(value):
+                    continue
             except Exception:
-                iso = str(ts)
-            w.writerow([iso, "%.3f" % ts, v, est_map.get(ts, "")])
-        return ("\ufeff" + buf.getvalue()).encode("utf-8")
+                continue
+            if ts != cur_ts:
+                if cur_ts is not None:
+                    yield self._csv_line([self._iso(cur_ts), "%.3f" % cur_ts] + [cur.get(c, "") for c in cols])
+                cur_ts, cur = ts, {}
+            cur[metric] = value
+        if cur_ts is not None:
+            yield self._csv_line([self._iso(cur_ts), "%.3f" % cur_ts] + [cur.get(c, "") for c in cols])
+
+    def iter_traffic_csv(self, range_):
+        """导出流量统计 CSV（流式）。"""
+        seconds = self._RANGE_SECONDS.get(range_, 604800) if range_ in self._RANGE_SECONDS else 604800
+        db = self.collector.db
+        pf = ["net_", "ctr_"]
+        cols = db.export_columns(seconds, prefixes=pf)
+        return self._iter_wide_csv(seconds, cols, db.iter_rows(seconds, prefixes=pf),
+                                   [["说明", "流量历史库暂无采样数据"]])
+
+    def iter_power_csv(self, range_):
+        """导出功耗统计 CSV（流式，完整区间；旧版受 7200 行上限截断）。"""
+        seconds = self._RANGE_SECONDS.get(range_, 604800) if range_ in self._RANGE_SECONDS else 604800
+        db = self.collector.db
+
+        def gen():
+            yield "\ufeff".encode("utf-8")
+            yield self._csv_line(["时间(本地)", "unix_ts", "功耗(W)", "估算功耗(W)"])
+            cur_ts, cur = None, {}
+            for ts, metric, value in db.iter_rows(seconds, metrics=["power", "power_est"]):
+                if ts != cur_ts:
+                    if cur_ts is not None and "power" in cur:
+                        yield self._csv_line([self._iso(cur_ts), "%.3f" % cur_ts, cur["power"],
+                                              cur.get("power_est", "")])
+                    cur_ts, cur = ts, {}
+                cur[metric] = value
+            if cur_ts is not None and "power" in cur:
+                yield self._csv_line([self._iso(cur_ts), "%.3f" % cur_ts, cur["power"], cur.get("power_est", "")])
+        return gen()
 
     def api_gpu(self):
         """GPU 实时监控。"""
@@ -5437,26 +6345,11 @@ class MonitorApp:
             snap = {}
         seconds = 86400 * 7  # 最近 7 天
         try:
-            rows = self.collector.db.export_rows(seconds)
+            # SQL 内逐指标聚合（旧版 fetchall 7 天全部行，Docker 主机约 200 万行 / 400MB 峰值内存）
+            agg = self.collector.db.report_stats(seconds)
         except Exception:
             traceback.print_exc()
-            rows = []
-        # 各指标最近值 / 最大 / 平均
-        agg = {}
-        for row in rows:
-            try:
-                ts, metric, value = row
-                metric = str(metric)
-                value = float(value)
-                if not math.isfinite(value):
-                    continue
-            except Exception:
-                continue
-            a = agg.setdefault(metric, {"last": value, "max": value, "sum": 0.0, "n": 0})
-            a["last"] = value
-            a["max"] = max(a["max"], value)
-            a["sum"] += value
-            a["n"] += 1
+            agg = {}
         summary = {}
         for metric, a in agg.items():
             summary[metric] = {
@@ -5465,19 +6358,29 @@ class MonitorApp:
                 "avg": round(a["sum"] / a["n"], 2) if a["n"] else None,
                 "samples": a["n"],
             }
-        # 阈值判定
+        # 阈值判定：与界面「设置 → 提醒阈值」同口径（ui.json thresholds，缺省用 THRESHOLD_SPEC 默认值）
+        th = sanitize_thresholds((self.api_ui_get().get("ui") or {}).get("thresholds"))
         alerts = []
-        if "temp" in summary and summary["temp"]["max"] and summary["temp"]["max"] >= 80:
-            alerts.append({"level": "warn", "item": "CPU 温度", "value": summary["temp"]["max"], "threshold": "≥80°C"})
-        if "mem" in summary and summary["mem"]["max"] and summary["mem"]["max"] >= 90:
-            alerts.append({"level": "warn", "item": "内存占用", "value": summary["mem"]["max"], "threshold": "≥90%"})
-        if "disk_total" in summary and summary["disk_total"]["max"] and summary["disk_total"]["max"] >= 90:
-            alerts.append({"level": "warn", "item": "磁盘占用", "value": summary["disk_total"]["max"], "threshold": "≥90%"})
+
+        def _judge(metric, stat, item, warn_k, crit_k, unit):
+            v = (summary.get(metric) or {}).get(stat)
+            if v is None:
+                return
+            if v >= th[crit_k]:
+                alerts.append({"level": "crit", "item": item, "value": v, "threshold": "≥%s%s" % (th[crit_k], unit)})
+            elif v >= th[warn_k]:
+                alerts.append({"level": "warn", "item": item, "value": v, "threshold": "≥%s%s" % (th[warn_k], unit)})
+
+        _judge("temp", "max", "CPU 温度（峰值）", "tempWarn", "tempCrit", "°C")
+        _judge("cpu", "avg", "CPU 占用（平均）", "cpuWarn", "cpuCrit", "%")
+        _judge("mem", "max", "内存占用（峰值）", "memWarn", "memCrit", "%")
+        _judge("disk_total", "max", "存储占用（峰值）", "capWarn", "capCrit", "%")
         return {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "version": VERSION,
             "summary": summary,
             "alerts": alerts,
+            "thresholds": th,
             "overview": snap,
         }
 
@@ -5515,7 +6418,7 @@ class MonitorApp:
 body{font-family:system-ui,'PingFang SC',sans-serif;background:#f1f5f9;margin:0;padding:24px;color:#0f172a}
 .card{background:#fff;border-radius:16px;padding:24px;margin:16px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;color:#334155;margin:0 0 12px}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #e2e8f0}
+table{width:100%%;border-collapse:collapse}th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #e2e8f0}
 th{color:#64748b;font-weight:600;font-size:13px}.meta{color:#94a3b8;font-size:13px}
 .badge{display:inline-block;background:#ecfdf5;color:#059669;border-radius:999px;padding:2px 10px;font-size:12px}
 </style></head><body>
@@ -5547,86 +6450,40 @@ th{color:#64748b;font-weight:600;font-size:13px}.meta{color:#94a3b8;font-size:13
                 pass
         return result
 
-    def api_export_history_csv(self, range_):
-        """历史指标导出为 CSV 宽表（每行一个时间点，各指标一列）。"""
+    def iter_history_csv(self, range_):
+        """历史指标导出为 CSV 宽表（每行一个时间点，各指标一列），流式输出。"""
+        seconds = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 604800)
+        db = self.collector.db
         try:
-            return self._export_history_csv_impl(range_)
+            found = db.export_columns(seconds)
         except Exception:
             traceback.print_exc()
-            # 兜底：导出失败时返回带说明的 CSV，避免 500 空错误页
-            b2 = io.StringIO()
-            w2 = csv.writer(b2)
-            w2.writerow(["导出失败", "生成 CSV 时发生错误，请查看服务日志（journalctl / 应用日志）中的异常堆栈"])
-            return ("\ufeff" + b2.getvalue()).encode("utf-8")
-
-    def _export_history_csv_impl(self, range_):
-        seconds = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "all": 0}.get(range_, 604800)
-        rows = self.collector.db.export_rows(seconds)
-        by_ts = {}
-        order = []
-        metric_set = []
-        for row in rows:
-            try:
-                ts, metric, value = row
-                ts = float(ts)
-                value = float(value)
-                metric = str(metric)
-                if not math.isfinite(value):
-                    continue
-            except Exception:
-                continue
-            if ts not in by_ts:
-                by_ts[ts] = {}
-                order.append(ts)
-            by_ts[ts][metric] = value
-            if metric not in metric_set:
-                metric_set.append(metric)
-        # 历史库无数据时返回带说明的 CSV，明确原因而非空表头
-        if not order:
-            buf = io.StringIO()
-            w = csv.writer(buf)
-            w.writerow(["说明", "历史库暂无采样数据"])
-            w.writerow(["提示", "历史数据每 60 秒写入一条，请等待后台采集后再导出；若持续为空，可访问 /api/history/diag 查看历史库状态"])
-            return ("\ufeff" + buf.getvalue()).encode("utf-8")
+            found = []
         # 固定核心指标靠前，其余（分区/网卡等）按出现顺序追加
         fixed = ["cpu", "mem", "load1", "disk_total", "temp"]
-        cols = [m for m in fixed if m in metric_set] + [m for m in metric_set if m not in fixed]
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["时间(本地)", "unix_ts"] + cols)
-        for ts in order:
-            row = by_ts[ts]
-            try:
-                iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-            except Exception:
-                iso = str(ts)
-            w.writerow([iso, "%.3f" % ts] + [row.get(c, "") for c in cols])
-        return ("\ufeff" + buf.getvalue()).encode("utf-8")  # 加 BOM，Excel/WPS 直接打开不乱码
+        cols = [m for m in fixed if m in found] + [m for m in found if m not in fixed]
+        return self._iter_wide_csv(seconds, cols, db.iter_rows(seconds), [
+            ["说明", "历史库暂无采样数据"],
+            ["提示", "历史数据每 60 秒写入一条，请等待后台采集后再导出；若持续为空，可访问 /api/history/diag 查看历史库状态"]])
 
     def api_monthly_summary(self):
         """返回最近的月度汇总数据（上月优先，无则取最近一条）。
 
-        数据来自 monthly_summary 表（cleanup 前增量叠加归档 + 月初补全）。
+        数据来自 monthly_summary 表（水位线归档：cleanup 前与月初各数据只计入一次）。
         速率型指标返回 avg/max/min；累计型指标（流量）返回月内差值 = last_val - first_val。
         """
         enabled = bool(int(self.config.get("monthly_summary_enabled", 0) or 0))
         retention = int(self.config.get("retention_days", 7))
-        conn = sqlite3.connect(self.collector.db.db_path, timeout=15)
         try:
-            row = conn.execute(
-                "SELECT year, month FROM monthly_summary ORDER BY year DESC, month DESC LIMIT 1"
-            ).fetchone()
-            if not row:
-                return {"available": False, "enabled": enabled,
-                        "retention_days": retention,
-                        "note": "暂无汇总数据（需开启开关后等待后台采集归档）"}
-            y, m = row
-            rows = conn.execute(
-                "SELECT metric, sum_val, count_val, max_val, min_val, first_val, last_val "
-                "FROM monthly_summary WHERE year=? AND month=?", (y, m)
-            ).fetchall()
-        finally:
-            conn.close()
+            got = self.collector.db.monthly_rows()   # 休眠保护：硬盘休眠时返回上次结果，不读库
+        except Exception:
+            traceback.print_exc()
+            got = None
+        if not got:
+            return {"available": False, "enabled": enabled,
+                    "retention_days": retention,
+                    "note": "暂无汇总数据（需开启开关后等待后台采集归档）"}
+        y, m, rows = got
         hist_interval = int(self.config.get("history_interval", 60))
         result = {"year": y, "month": m, "available": True, "enabled": enabled,
                   "retention_days": retention}
@@ -5667,7 +6524,7 @@ th{color:#64748b;font-weight:600;font-size:13px}.meta{color:#94a3b8;font-size:13
         return {
             "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "version": VERSION,
-            "overview": self.api_overview(),
+            "overview": json.loads(self.api_overview().decode("utf-8")),   # 已去除口令哈希等敏感字段
             "docker": self.api_docker(),
             "modules": self.api_modules(),
             "processes": self.api_processes(),
@@ -5683,6 +6540,19 @@ def _metric_label(m):
         "disk_total": "磁盘占用 %", "temp": "CPU 温度 °C", "temp_mb": "主板温度 °C",
         "power": "整机功耗 W", "fan_avg": "风扇平均 RPM", "net_rx": "网络下行", "net_tx": "网络上行",
     }.get(m, m)
+
+
+_SECRET_ARG_RE = re.compile(
+    r"(?i)((?:^|[\s\-])(?:[\w.-]*(?:pass(?:word|wd)?|pwd|token|secret|api[_-]?key|access[_-]?key|auth[_-]?key)"
+    r"[\w.-]*)(?:=|:|\s+))(\S+)")
+
+
+def _redact_args(args):
+    """进程命令行脱敏：password=xxx / --token xxx 等参数值替换为 ***。"""
+    try:
+        return _SECRET_ARG_RE.sub(lambda m: m.group(1) + "***", args)
+    except Exception:
+        return args
 
 
 def top_processes(limit=20):
@@ -5712,7 +6582,7 @@ def top_processes(limit=20):
             continue
         result.append({
             "pid": pid, "user": user, "cpu": cpu, "mem": mem,
-            "rss": rss_kb * 1024, "comm": comm, "args": args[:160],
+            "rss": rss_kb * 1024, "comm": comm, "args": _redact_args(args)[:160],
         })
         if len(result) >= limit:
             break
@@ -5949,59 +6819,180 @@ def sync_launcher_db(mode=None, port=None):
 
 
 def load_config(data_dir):
+    """读取 config.json（逐项容错：单个字段格式错误不影响其余字段，尤其不能让鉴权静默失效）。
+    发现旧版明文 auth_password 时自动迁移为 PBKDF2 哈希、删除明文并以 0600 重写文件。"""
     cfg = dict(DEFAULT_CONFIG)
     cfg_path = os.path.join(data_dir, "config.json")
     try:
         with open(cfg_path, "r", errors="ignore") as f:
             user = json.load(f)
-        for k in ("interval", "retention_days", "port", "history_interval"):
-            if k in user:
-                cfg[k] = int(user[k])
-        # 在线更新开关必须随配置恢复（此前不在读取白名单，重启/升级后回落默认值，
-        # 用户开启的「自动更新」失效）
-        for k in ("update_autocheck", "update_autodownload", "update_autoupdate"):
-            if k in user:
-                cfg[k] = 1 if str(user[k]) in ("1", "true", "on") else 0
-        # 流量与功耗配置必须随配置恢复（同类 bug 见 v2.9.9 自动更新开关）
-        for k in ("traffic_exclude_bridge",):
-            if k in user:
-                cfg[k] = 1 if str(user[k]) in ("1", "true", "on") else 0
-        for k in ("power_tdp_w", "power_disk_typical_w", "power_nic_fixed_w",
-                  "power_rate_yuan", "power_base_w"):
-            if k in user:
-                try:
-                    cfg[k] = float(user[k])
-                except Exception:
-                    pass
-        # 硬盘休眠保护开关（默认开启：监控不主动唤醒已停转的机械硬盘）
-        if "disk_standby_protect" in user:
-            cfg["disk_standby_protect"] = 1 if str(user["disk_standby_protect"]) in ("1", "true", "on") else 0
-        # 上月汇总开关：cleanup 前增量叠加归档 + 仪表盘显示上月汇总
-        if "monthly_summary_enabled" in user:
-            cfg["monthly_summary_enabled"] = 1 if str(user["monthly_summary_enabled"]) in ("1", "true", "on") else 0
-        if "weather_city" in user:
-            cfg["weather_city"] = str(user["weather_city"])
-        if "data_dir" in user:
-            cfg["data_dir"] = str(user["data_dir"]).strip()
-        # 飞牛桌面打开方式（iframe=飞牛窗口内打开 / url=浏览器新标签页）
-        if str(user.get("open_mode", "")).lower() in ("iframe", "url"):
-            cfg["open_mode"] = str(user["open_mode"]).lower()
-        # 登录口令（明文存储，与应用内设置一致；空口令=未设置）
-        if "auth_enabled" in user:
-            cfg["auth_enabled"] = 1 if str(user["auth_enabled"]) in ("1", "true", "on") else 0
-        if "auth_password" in user:
-            cfg["auth_password"] = str(user["auth_password"])
-        if "auth_session_days" in user:
+        if not isinstance(user, dict):
+            user = {}
+    except Exception:
+        user = {}
+    onoff = lambda x: 1 if str(x).lower() in ("1", "true", "on") else 0
+    for k in ("interval", "retention_days", "port", "history_interval"):
+        if k in user:
             try:
-                cfg["auth_session_days"] = max(1, min(365, int(user["auth_session_days"])))
+                cfg[k] = int(user[k])
             except Exception:
                 pass
-    except Exception:
-        pass
+    # 开关类（在线更新 / 流量 / 休眠保护 / 上月汇总 / 鉴权 / EC 风扇探测）必须随配置恢复
+    for k in ("update_autocheck", "update_autodownload", "update_autoupdate", "traffic_exclude_bridge",
+              "disk_standby_protect", "monthly_summary_enabled", "auth_enabled", "ec_fan_probe"):
+        if k in user:
+            cfg[k] = onoff(user[k])
+    for k in ("power_tdp_w", "power_disk_typical_w", "power_nic_fixed_w",
+              "power_rate_yuan", "power_base_w"):
+        if k in user:
+            try:
+                cfg[k] = float(user[k])
+            except Exception:
+                pass
+    if "weather_city" in user:
+        cfg["weather_city"] = clean_text(user["weather_city"], 64)
+    if "data_dir" in user:
+        cfg["data_dir"] = str(user["data_dir"]).strip()
+    # 飞牛桌面打开方式（iframe=飞牛窗口内打开 / url=浏览器新标签页）
+    if str(user.get("open_mode", "")).lower() in ("iframe", "url"):
+        cfg["open_mode"] = str(user["open_mode"]).lower()
+    if "auth_session_days" in user:
+        try:
+            cfg["auth_session_days"] = max(1, min(365, int(user["auth_session_days"])))
+        except Exception:
+            pass
+    h = str(user.get("auth_password_hash") or "").strip()
+    if h.startswith("pbkdf2_sha256$"):
+        cfg["auth_password_hash"] = h
+    legacy = str(user.get("auth_password") or "")
+    if "auth_password" not in user and os.path.exists(cfg_path) and _file_mode(cfg_path) & 0o077:
+        try:
+            os.chmod(cfg_path, 0o600)    # 旧版 / 安装脚本创建的 0644 配置文件收紧权限
+        except Exception:
+            pass
+    if "auth_password" in user:
+        # 迁移：明文 → 哈希（已有哈希时只删除明文），以 0600 原子重写
+        if legacy.strip() and not cfg["auth_password_hash"]:
+            cfg["auth_password_hash"] = hash_password(legacy.strip())
+            print("[fnmonitor] 已将 config.json 中的明文登录口令迁移为 PBKDF2 哈希")
+        try:
+            with _CFG_WRITE_LOCK:
+                new = dict(user)
+                new.pop("auth_password", None)
+                if cfg["auth_password_hash"]:
+                    new["auth_password_hash"] = cfg["auth_password_hash"]
+                write_json_secure(cfg_path, new)
+        except Exception:
+            traceback.print_exc()
     return cfg
 
 
-class DualStackHTTPServer(ThreadingHTTPServer):
+def _file_mode(path):
+    try:
+        return os.stat(path).st_mode & 0o777
+    except Exception:
+        return 0
+
+
+def port_available(port):
+    """测试端口能否被本进程绑定（双栈优先；SO_REUSEADDR 与 HTTPServer 一致，TIME_WAIT 不误判）。"""
+    for fam, addr in ((socket.AF_INET6, "::"), (socket.AF_INET, "0.0.0.0")):
+        try:
+            sk = socket.socket(fam, socket.SOCK_STREAM)
+        except OSError:
+            continue
+        try:
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if fam == socket.AF_INET6:
+                try:
+                    sk.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except Exception:
+                    pass
+            sk.bind((addr, int(port)))
+            return True
+        except (OSError, OverflowError, ValueError) as e:
+            if fam == socket.AF_INET6 and getattr(e, "errno", None) in (97, 99, 22):  # 无 IPv6：退回 IPv4 测试
+                continue
+            return False
+        finally:
+            sk.close()
+    return False
+
+
+_SYSTEM_DIR_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/etc", "/boot", "/usr", "/bin", "/sbin",
+                        "/lib", "/lib32", "/lib64", "/libx32", "/var/apps", "/var/lib/dpkg")
+
+
+def validate_data_dir(nd):
+    """自定义数据目录：须为绝对路径，不能落在系统目录内。返回 (ok, 原因)。"""
+    if not os.path.isabs(nd):
+        return False, "数据目录须为以 / 开头的绝对路径"
+    rp = os.path.realpath(os.path.normpath(nd))
+    if rp == "/" or any(rp == p or rp.startswith(p + "/") for p in _SYSTEM_DIR_PREFIXES):
+        return False, "数据目录不能位于系统目录（%s）" % rp
+    return True, ""
+
+
+class BoundedHTTPServerMixin:
+    """限制并发处理线程：总数 MAX_CONN、单 IP MAX_PER_IP，超出的连接立即回 503 并关闭，
+    防止半开连接 / 慢速请求耗尽线程与文件描述符。"""
+    MAX_CONN = 64
+    MAX_PER_IP = 24
+    daemon_threads = True
+    _BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\n"
+             b"Retry-After: 2\r\nConnection: close\r\nContent-Length: 27\r\n\r\n"
+             b'{"ok":false,"error":"busy"}')
+
+    def _slot_init(self):
+        if not hasattr(self, "_slot_lock"):
+            self._slot_lock = threading.Lock()
+            self._slot_total = 0
+            self._slot_ips = {}
+
+    def process_request(self, request, client_address):
+        self._slot_init()
+        ip = norm_ip(client_address[0] if client_address else "")
+        with self._slot_lock:
+            ok = self._slot_total < self.MAX_CONN and self._slot_ips.get(ip, 0) < self.MAX_PER_IP
+            if ok:
+                self._slot_total += 1
+                self._slot_ips[ip] = self._slot_ips.get(ip, 0) + 1
+        if not ok:
+            try:
+                request.settimeout(1.0)
+                request.sendall(self._BUSY)
+            except Exception:
+                pass
+            self.shutdown_request(request)
+            return
+        t = threading.Thread(target=self._slot_run, args=(request, client_address, ip), daemon=True)
+        try:
+            t.start()
+        except Exception:
+            self._slot_release(ip)
+            self.shutdown_request(request)
+
+    def _slot_run(self, request, client_address, ip):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._slot_release(ip)
+
+    def _slot_release(self, ip):
+        with self._slot_lock:
+            self._slot_total -= 1
+            n = self._slot_ips.get(ip, 1) - 1
+            if n <= 0:
+                self._slot_ips.pop(ip, None)
+            else:
+                self._slot_ips[ip] = n
+
+
+class BoundedHTTPServer(BoundedHTTPServerMixin, ThreadingHTTPServer):
+    pass
+
+
+class DualStackHTTPServer(BoundedHTTPServer):
     """双栈 HTTP 服务：同时监听 IPv4 与 IPv6（IPV6_V6ONLY=0）。
 
     默认 ThreadingHTTPServer 监听 0.0.0.0 仅支持 IPv4，导致 IPv6 地址 / IPv6 公网
@@ -6018,19 +7009,54 @@ class DualStackHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+def _bind_server(bind_host, port, handler):
+    """创建并绑定 HTTP 服务；失败抛异常。返回 (httpd, 监听说明)。"""
+    if bind_host in ("0.0.0.0", "", None):
+        try:
+            return DualStackHTTPServer(("::", port), handler), ":: (IPv4+IPv6)"
+        except (OSError, OverflowError) as e:
+            if isinstance(e, OverflowError) or getattr(e, "errno", None) == 98:
+                raise            # 端口越界 / 被占用：IPv4 回退同样会失败
+            traceback.print_exc()
+            return BoundedHTTPServer(("0.0.0.0", port), handler), "0.0.0.0 (IPv4)"
+    return BoundedHTTPServer((bind_host, port), handler), bind_host
+
+
 def main():
     ap = argparse.ArgumentParser(description="fnMonitor - fnOS 系统监控后端")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--data-dir", default=os.environ.get("TRIM_PKGVAR", "/tmp/fnmonitor-data"))
     args = ap.parse_args()
+    # 日志行缓冲：stdout 重定向到 server.log 时登录失败等安全日志即时落盘
+    for _st in (sys.stdout, sys.stderr):
+        try:
+            _st.reconfigure(line_buffering=True)
+        except Exception:
+            pass
 
     os.makedirs(args.data_dir, exist_ok=True)
     original_dir = args.data_dir
+    # 单实例锁：同一配置目录只允许一个服务进程（防止 PID 文件失效时重复启动，
+    # 第二个实例经端口回退在另一端口起来并与第一个实例同时写库）。重启时等待旧进程退出
+    _lock_fh = None
+    try:
+        import fcntl
+        _lock_fh = open(os.path.join(original_dir, ".server.lock"), "a")
+        for _i in range(30):
+            try:
+                fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            raise SystemExit("[fnmonitor] 已有一个飞牛监控实例在使用 %s，本次启动退出" % original_dir)
+    except ImportError:
+        pass
     config = load_config(args.data_dir)
     # 数据保存目录：默认 = 应用数据目录/localdata 子文件夹；用户可在设置页自定义（data_dir 配置覆盖）
     custom_dir = str(config.get("data_dir") or "").strip()
-    if not (custom_dir and os.path.isabs(custom_dir)):
+    if not (custom_dir and os.path.isabs(custom_dir) and validate_data_dir(custom_dir)[0]):
         custom_dir = os.path.join(args.data_dir, "localdata")
     try:
         os.makedirs(custom_dir, exist_ok=True)
@@ -6051,12 +7077,36 @@ def main():
         traceback.print_exc()
         print("[fnmonitor] 自定义数据目录不可用，回退到 %s" % original_dir)
         args.data_dir = original_dir
-    # 配置文件里指定了端口则优先（网页设置修改端口后重启生效）
-    port = int(config.get("port") or 0) or args.port
+
+    app = MonitorApp(args.data_dir, config, args.host, args.port, cfg_dir=original_dir)
+    handler = app.make_handler()
+    # 端口：配置文件优先（网页设置修改端口后重启生效）。配置端口越界或无法绑定时依次回退到
+    # 启动参数端口（manifest service_port）与 8777，保证服务永远能起来（并记录日志）
+    want = int(config.get("port") or 0) or args.port
+    candidates = []
+    for p in (want, args.port, 8777):
+        if p not in candidates:
+            candidates.append(p)
+    httpd, listen_hint, port, last_err = None, "", None, None
+    for p in candidates:
+        if not (1 <= int(p) <= 65535):
+            print("[fnmonitor] 配置端口 %s 无效（须 1–65535），尝试回退" % p)
+            continue
+        try:
+            httpd, listen_hint = _bind_server(args.host, int(p), handler)
+            port = int(p)
+            break
+        except Exception as e:
+            last_err = e
+            print("[fnmonitor] 端口 %s 绑定失败（%s），尝试回退" % (p, e))
+    if httpd is None:
+        raise SystemExit("[fnmonitor] 无可用端口: %s" % last_err)
+    if port != want:
+        print("[fnmonitor] 已回退到端口 %d（配置端口 %s 不可用）" % (port, want))
+    app.port = port
     # 按用户配置同步桌面入口（升级包会覆盖 ui/config 并把应用中心数据库重置为
     # 包默认 iframe，type 与端口一并恢复；apply_launcher_entry 内部会同步 fnOS
-    # 应用中心数据库——桌面点击行为由数据库决定。此处不重启任何服务，刷新桌面页
-    # 即生效；未及时刷新时由前端占位页在内嵌窗口内兜底转跳）
+    # 应用中心数据库——桌面点击行为由数据库决定）。使用实际监听端口。
     try:
         _m = str(config.get("open_mode") or "").lower()
         ok_l, msg_l = apply_launcher_entry(mode=(_m or None), port=port)
@@ -6064,27 +7114,11 @@ def main():
             print("[fnmonitor] 桌面入口配置同步失败: %s" % msg_l)
     except Exception as e:
         print("[fnmonitor] 桌面入口配置同步异常: %s" % e)
-
-    app = MonitorApp(args.data_dir, config, args.host, port, cfg_dir=original_dir)
-    handler = app.make_handler()
-    # 双栈监听：默认 0.0.0.0 时同时监听 IPv4 + IPv6（IPv6 地址 / IPv6 公网域名+端口可直连）
-    bind_host = args.host
-    if bind_host in ("0.0.0.0", "", None):
-        try:
-            httpd = DualStackHTTPServer(("::", port), handler)
-            listen_hint = ":: (IPv4+IPv6)"
-        except Exception:
-            traceback.print_exc()
-            httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
-            listen_hint = "0.0.0.0 (IPv4)"
-    else:
-        httpd = ThreadingHTTPServer((bind_host, port), handler)
-        listen_hint = bind_host
     app.collector.start()
 
     def shutdown(sig, frame):
         app.collector.stop()
-        httpd.shutdown()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -6092,9 +7126,11 @@ def main():
 
     print("fnMonitor %s listening on http://[%s]:%d" % (VERSION, listen_hint, port))
     print("data-dir: %s" % args.data_dir)
+    if not app._auth_required():
+        print("[fnmonitor] 提示：未启用登录口令，仅允许通过 IP / 局域网主机名访问（Host 白名单）")
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         app.collector.stop()

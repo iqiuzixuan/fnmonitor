@@ -1,0 +1,91 @@
+# 发布流程：推送版本标签（如 2.18.0，不带 v，须与 manifest 的 version 一致）即自动
+#   1. 用飞牛官方 fnpack 构建 x86 / arm 两个 fpk
+#   2. 创建同名 GitHub Release 并上传安装包与图标
+#   3. 计算 sha256 / 大小写入 fnpack.json 并提交到 main —— FnDepot 客户端据此在线安装 / 升级
+name: release
+
+on:
+  push:
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（如 2.18.0，需已推送）"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  FNPACK_VERSION: "1.2.3"
+  # 官方 fnpack-1.2.3-linux-amd64 的 sha256，升级 fnpack 时同步更新
+  FNPACK_SHA256: "54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 确定标签
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 校验标签与 manifest 版本一致
+        id: ver
+        run: |
+          VERSION=$(sed -n 's/^version=//p' manifest | head -1 | tr -d '[:space:]')
+          [ -n "$VERSION" ] || { echo "manifest 缺少 version"; exit 1; }
+          [ "${{ steps.tag.outputs.tag }}" = "$VERSION" ] || { echo "标签 ${{ steps.tag.outputs.tag }} 与 manifest 版本 $VERSION 不一致"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 下载并校验 fnpack
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/fnpack" "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          echo "${FNPACK_SHA256}  $RUNNER_TEMP/bin/fnpack" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/fnpack"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: 语法检查
+        run: python3 -m py_compile app/server.py tools/update_fnpack.py
+
+      - name: 校验前端已由 ui-src 构建
+        run: |
+          sh tools/build_ui.sh
+          git diff --exit-code app/www/index.html || { echo "app/www/index.html 与 ui-src/ 不一致：请修改 ui-src 后执行 sh tools/build_ui.sh 再提交"; exit 1; }
+
+      - name: 构建 x86 / arm 安装包
+        run: bash build.sh
+
+      - name: 创建 Release 并上传
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          # 标签即版本号（与原作者 Releases 惯例一致）；fnpack.json 与应用内更新都按「版本号/文件名」拼下载地址
+          NOTES=$(sed -n 's/^changelog=//p' manifest | head -1 | sed 's/<br><br>.*//; s/<br>/\n/g; s/<[^>]*>//g')
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION 已存在：已发布版本视为不可变，请改用新版本号"; exit 1
+          fi
+          gh release create "$VERSION" --verify-tag --title "v$VERSION" --notes "$NOTES" \
+            "fnmonitor-$VERSION-x86.fpk" "fnmonitor-$VERSION-arm.fpk" ICON_256.PNG
+
+      - name: 回写 fnpack.json 到 main
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          python3 tools/update_fnpack.py
+          git add fnpack.json
+          git commit -m "fnpack.json: 发布 $VERSION [skip ci]" || { echo "fnpack.json 无变化"; exit 0; }
+          git push origin main
