@@ -29,6 +29,23 @@
    "is_docker": false,
    "service_port": "8777",
    "releases": {
+    "2.18.3": {
+     "changelog": "v2.18.3<br>① <b>健康检查支持忽略</b>：首页结论 / 健康报告中的问题项可手动忽略，忽略后不再计入结论与健康分；设置新增「已忽略的提醒」列表，可逐项或全部恢复提醒；被忽略的项一旦发生变化（如 SMART 计数增加、停止的容器变化）会自动重新提醒<br>② <b>全新应用图标与网站图标</b>：点阵负载柱图标，浏览器标签页、主屏书签与应用中心统一<br>③ 修复：天气「自动定位」开关打开后无法关闭；暗色模式下切换开关时设置项左侧闪出白色块<br>④ <b>性能</b>：HTTP 长连接关闭 Nagle 算法，每个接口请求不再白等约 40ms，轮询与页面切换明显更跟手<br>⑤ 修复：已安装 Docker 但还没有容器时误报「Docker 不可用」<br>⑥ 新增自动化回归测试（CI 覆盖 Python 3.9–3.13），发布前必须通过",
+     "updated_at": "2026-10-13T11:13:37+08:00",
+     "os_min_version": "0.9.0",
+     "packages": {
+      "x86": {
+       "download_url": "https://github.com/iqiuzixuan/fnmonitor/releases/download/2.18.3/fnmonitor-2.18.3-x86.fpk",
+       "sha256": "197b1293fe5fbbaf853d9f276f7388e07a3d564f59aacdacdb5ceccff52af966",
+       "size": 560582
+      },
+      "arm": {
+       "download_url": "https://github.com/iqiuzixuan/fnmonitor/releases/download/2.18.3/fnmonitor-2.18.3-arm.fpk",
+       "sha256": "3b32d430580aeeb4c1071f5ea4e5719bb975e6562dd9ab83ef7cb3dca8e5904d",
+       "size": 560582
+      }
+     }
+    },
     "2.18.1": {
      "changelog": "v2.18.1<br>① <b>核显占用实测</b>：直接读取 i915 内核性能计数器（与 intel_gpu_top 同源，无需安装工具），显示渲染 / 视频 / 视频增强 / 复制 / 计算各引擎占用；读不到时按 RC6 驻留时间估算活跃度；不再用 CPU 温度、整机内存冒充核显温度与显存；新增 /api/gpu?diag=1 诊断信息<br>② <b>容器实时网速</b>：容器列表与详情显示每个容器的下行 / 上行速率<br>③ <b>近 30 天按天统计</b>：新增按天汇总（清理历史前累加保存，历史只保留 7 天也能积累 30 天），用电与流量柱状图改用真实每日数据；今日 / 本月用电与流量改由按天汇总计算，不再受历史保留天数影响<br>④ <b>全年电费估算</b>：按近 30 天平均功耗推算并标注口径<br>⑤ 修复：容器运行状态混有英文单位；Docker 流量单位解析错误（小流量容器显示为 0）",
      "updated_at": "2026-10-13T10:29:41+08:00",
