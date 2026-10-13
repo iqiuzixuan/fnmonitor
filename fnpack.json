@@ -29,6 +29,23 @@
    "is_docker": false,
    "service_port": "8777",
    "releases": {
+    "2.18.4": {
+     "changelog": "v2.18.4<br>① <b>应用日志不再刷屏</b>：应用中心轮询运行状态时不再每次写入一行 “fnmonitor is running”；日志只记录启动 / 停止 / 重启 / 启动失败，并带时间、版本与端口",
+     "updated_at": "2026-10-13T11:26:00+08:00",
+     "os_min_version": "0.9.0",
+     "packages": {
+      "x86": {
+       "download_url": "https://github.com/iqiuzixuan/fnmonitor/releases/download/2.18.4/fnmonitor-2.18.4-x86.fpk",
+       "sha256": "bc15991371562d76214ba0a782eefd5bd6460175adf4acff7e532d9fc6915163",
+       "size": 560956
+      },
+      "arm": {
+       "download_url": "https://github.com/iqiuzixuan/fnmonitor/releases/download/2.18.4/fnmonitor-2.18.4-arm.fpk",
+       "sha256": "5cd0dfbe708adb4871d3608e7e5db9e27d53e9d18bccfb8e6fcae0bcfe239d2b",
+       "size": 560956
+      }
+     }
+    },
     "2.18.3": {
      "changelog": "v2.18.3<br>① <b>健康检查支持忽略</b>：首页结论 / 健康报告中的问题项可手动忽略，忽略后不再计入结论与健康分；设置新增「已忽略的提醒」列表，可逐项或全部恢复提醒；被忽略的项一旦发生变化（如 SMART 计数增加、停止的容器变化）会自动重新提醒<br>② <b>全新应用图标与网站图标</b>：点阵负载柱图标，浏览器标签页、主屏书签与应用中心统一<br>③ 修复：天气「自动定位」开关打开后无法关闭；暗色模式下切换开关时设置项左侧闪出白色块<br>④ <b>性能</b>：HTTP 长连接关闭 Nagle 算法，每个接口请求不再白等约 40ms，轮询与页面切换明显更跟手<br>⑤ 修复：已安装 Docker 但还没有容器时误报「Docker 不可用」<br>⑥ 新增自动化回归测试（CI 覆盖 Python 3.9–3.13），发布前必须通过",
      "updated_at": "2026-10-13T11:13:37+08:00",
