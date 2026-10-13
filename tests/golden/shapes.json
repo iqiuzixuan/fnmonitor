@@ -259,5 +259,13 @@
  },
  "/api/ui": {
   "ui": {}
+ },
+ "/api/vms": {
+  "available": "bool",
+  "error": "str",
+  "installed": "bool",
+  "kvm": "bool",
+  "sampled_at": "number",
+  "vms": "list"
  }
 }

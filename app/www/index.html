@@ -1209,6 +1209,13 @@ dd .diag-link{margin:0;height:24px}
 .ig-row .ig-state.gone{color:var(--ink-3)}
 .btn.sm{height:30px;padding:0 12px;font-size:var(--fs-xs)}
 [data-ref="probs"]>* + *{margin-top:var(--s4)}
+.ctr.vm{grid-template-columns:minmax(180px,1.5fr) minmax(120px,1fr) 140px 100px 118px 118px 96px 80px}
+.vm-note{margin:14px 2px 0}
+@media (max-width: 1120px){.ctr.vm{grid-template-columns:minmax(160px,1.4fr) minmax(110px,1fr) 130px 96px 112px 80px}
+.ctr.vm .vm-io{display:none}
+}
+@media (max-width: 960px){.ctr.vm{grid-template-columns:minmax(0,1fr) auto}
+}
 </style>
 </head>
 <body>
@@ -1236,6 +1243,9 @@ dd .diag-link{margin:0;height:24px}
     <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.8v12.4a.8.8 0 0 0 1.2.7l10-6.2a.8.8 0 0 0 0-1.4l-10-6.2A.8.8 0 0 0 8 5.8Z"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2.2"/></symbol>
     <symbol id="i-restart" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4v4h-4"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8"/><path d="M7.4 6.6a7.5 7.5 0 1 0 9.2 0"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="7" y="6" width="3.2" height="12" rx="1"/><rect x="13.8" y="6" width="3.2" height="12" rx="1"/></symbol>
+    <symbol id="i-vm" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2.5"/><path d="M8.5 20.5h7M12 17v3.5M8.5 8.5l2.5 2-2.5 2M13 12.5h2.5"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></symbol>
     <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="4.5" rx="1.6"/><rect x="13.5" y="11" width="7" height="9.5" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/></symbol>
     <symbol id="i-grip" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/></g></symbol>
@@ -1286,6 +1296,7 @@ dd .diag-link{margin:0;height:24px}
       <span class="thumb"></span>
       <button role="tab" type="button" data-page="overview" aria-selected="true">总览</button>
       <button role="tab" type="button" data-page="docker" aria-selected="false">容器</button>
+      <button role="tab" type="button" data-page="vms" aria-selected="false" hidden>虚拟机</button>
       <button role="tab" type="button" data-page="settings" aria-selected="false">设置</button>
     </nav>
     <div class="tools">
@@ -1309,6 +1320,9 @@ dd .diag-link{margin:0;height:24px}
   <section class="page" id="page-docker" data-page="docker" aria-label="容器与端口" hidden>
     <div class="layout" data-layout="docker" id="layout-docker"></div>
   </section>
+  <section class="page" id="page-vms" data-page="vms" aria-label="虚拟机" hidden>
+    <div class="layout" data-layout="vms" id="layout-vms"></div>
+  </section>
   <section class="page" id="page-settings" data-page="settings" aria-label="设置" hidden>
     <div class="page-head">
       <div>
@@ -1326,6 +1340,7 @@ dd .diag-link{margin:0;height:24px}
 <nav class="bottom-nav" id="bottomNav" aria-label="页面">
   <button type="button" data-page="overview" aria-selected="true"><svg class="i"><use href="#i-home"/></svg>总览</button>
   <button type="button" data-page="docker" aria-selected="false"><svg class="i"><use href="#i-box"/></svg>容器</button>
+  <button type="button" data-page="vms" aria-selected="false" hidden><svg class="i"><use href="#i-vm"/></svg>虚拟机</button>
   <button type="button" data-page="settings" aria-selected="false"><svg class="i"><use href="#i-gear"/></svg>设置</button>
 </nav>
 
@@ -1346,7 +1361,7 @@ dd .diag-link{margin:0;height:24px}
 </div>
 <div class="palette-wrap" id="palette" role="dialog" aria-modal="true" aria-label="搜索">
   <div class="palette">
-    <div class="palette-in"><svg class="i i-lg"><use href="#i-search"/></svg><input id="palInput" placeholder="搜索硬盘、容器、设置或页面…" autocomplete="off" spellcheck="false" aria-label="搜索"><span class="kbd">Esc</span></div>
+    <div class="palette-in"><svg class="i i-lg"><use href="#i-search"/></svg><input id="palInput" placeholder="搜索硬盘、容器、虚拟机、设置或页面…" autocomplete="off" spellcheck="false" aria-label="搜索"><span class="kbd">Esc</span></div>
     <div class="palette-list" id="palList"></div>
     <div class="palette-foot"><span><span class="kbd">↑</span><span class="kbd">↓</span> 选择</span><span><span class="kbd">↵</span> 打开</span><span><span class="kbd">/</span> 随时唤起</span></div>
   </div>
@@ -1939,10 +1954,10 @@ const THEMES = ['light', 'dark', 'auto'], ACCENT_IDS = ['black', 'blue', 'green'
 const RANGES = [['10m', '10分钟'], ['1h', '1小时'], ['6h', '6小时'], ['24h', '24小时'], ['7d', '7天'], ['all', '全部']];
 const RANGE_SEC = { '10m': 600, '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, all: 0 };
 const RANGE_TXT = { '10m': '过去 10 分钟', '1h': '过去 1 小时', '6h': '过去 6 小时', '24h': '过去 24 小时', '7d': '过去 7 天', all: '保留期内' };
-const LAYOUT_DEFAULT = { overview: ['metrics', 'storage', 'trends', 'compute', 'thermal', 'energy', 'network', 'procs', 'monthly', 'host'], docker: ['containers', 'ports', 'apps'] };
+const LAYOUT_DEFAULT = { overview: ['metrics', 'storage', 'trends', 'compute', 'thermal', 'energy', 'network', 'procs', 'monthly', 'host'], docker: ['containers', 'ports', 'apps'], vms: ['vms'] };
 const LEGACY_THEME = { dark: ['dark', 'black'], light: ['light', 'black'], blue: ['light', 'blue'], fresh: ['light', 'green'], green: ['light', 'green'], yellow: ['light', 'yellow'], cyan: ['light', 'cyan'] };
 function uiDefaults() {
-return { theme: 'light', accent: 'black', dotMatrix: true, motion: true, fontScale: 1, range: '24h', layoutVersion: LAYOUT_VERSION, layout: { overview: [], docker: [] }, hidden: { overview: [], docker: [] }, thresholds: sanitizeTH({}), ignored: [] };
+return { theme: 'light', accent: 'black', dotMatrix: true, motion: true, fontScale: 1, range: '24h', layoutVersion: LAYOUT_VERSION, layout: { overview: [], docker: [], vms: [] }, hidden: { overview: [], docker: [], vms: [] }, thresholds: sanitizeTH({}), ignored: [] };
 }
 const cleanIgnored = a => Array.isArray(a) ? a.filter(x => x && typeof x.key === 'string' && x.key.length <= 120 && typeof x.fp === 'string' && x.fp.length <= 400)
 .map(x => ({ key: x.key, fp: x.fp, label: String(x.label || x.key).slice(0, 160), level: ['warn', 'crit', 'info'].includes(x.level) ? x.level : 'warn', at: +x.at || 0 }))
@@ -1962,8 +1977,9 @@ if (RANGE_SEC[raw.range] !== undefined) u.range = raw.range;
 if (raw.thresholds) u.thresholds = sanitizeTH(raw.thresholds);
 if (raw.ignored) u.ignored = cleanIgnored(raw.ignored);
 if (isNew) {
-if (raw.layout && typeof raw.layout === 'object') u.layout = { overview: cleanIds(raw.layout.overview, 'overview'), docker: cleanIds(raw.layout.docker, 'docker') };
-if (raw.hidden && typeof raw.hidden === 'object') u.hidden = { overview: cleanIds(raw.hidden.overview, 'overview'), docker: cleanIds(raw.hidden.docker, 'docker') };
+const pick = o => { const r = {}; Object.keys(LAYOUT_DEFAULT).forEach(p => { r[p] = cleanIds(o[p], p); }); return r; };
+if (raw.layout && typeof raw.layout === 'object') u.layout = pick(raw.layout);
+if (raw.hidden && typeof raw.hidden === 'object') u.hidden = pick(raw.hidden);
 }
 u.layoutVersion = LAYOUT_VERSION;
 return u;
@@ -1983,10 +1999,10 @@ const LV_TXT = { warn: '偏高', crit: '严重' };
 const GiB = 1024 ** 3;
 const S = {
 page: 'overview', sheet: null, editing: false, ticks: 0,
-o: null, cfg: null, docker: null, procs: null, apps: null, ports: null, traffic: null, pstats: null, monthly: null, weather: null,
+o: null, cfg: null, docker: null, vms: null, vmTab: store.get('vmTab', false), procs: null, apps: null, ports: null, traffic: null, pstats: null, monthly: null, weather: null,
 online: null, fails: 0, lastOk: 0, cpuHigh: 0,
 live: { cpu: [], mem: [], temp: [], tempMb: [], power: [], rx: [], tx: [], dr: [], dw: [], fan: [], disk: [], load: [] },
-ctrBuf: {}, diskBuf: {}, visible: new Set(),
+ctrBuf: {}, vmBuf: {}, diskBuf: {}, visible: new Set(),
 };
 const BUF_N = 60;
 const push = (a, v, n = BUF_N) => { a.push(v); if (a.length > n) a.shift(); };
@@ -3405,7 +3421,7 @@ setHTML(x.kv, kvHTML([['镜像', `<span class="mono">${esc(c.image)}</span>`], [
 keys: {
 icon: () => 'key', title: () => '键盘快捷键', sub: () => '在任何页面都可使用',
 build(b) {
-const k = [['1 / 2 / 3', '切换到 总览 / 容器 / 设置'], ['/', '搜索硬盘、容器、设置'], ['E', '编辑布局（隐藏、拖动排序）'], ['T', '切换浅色 / 深色'], ['R', '循环切换趋势时间范围'], ['F11', '全屏'], ['Esc', '关闭抽屉 / 搜索 / 退出编辑'], ['?', '显示本面板']];
+const np = navPages(), k = [[np.map((p, i) => i + 1).join(' / '), '切换到 ' + np.map(p => PAGE_TITLE[p]).join(' / ')], ['/', '搜索硬盘、容器、虚拟机、设置'], ['E', '编辑布局（隐藏、拖动排序）'], ['T', '切换浅色 / 深色'], ['R', '循环切换趋势时间范围'], ['F11', '全屏'], ['Esc', '关闭抽屉 / 搜索 / 退出编辑'], ['?', '显示本面板']];
 b.innerHTML = `<div class="card"><div class="keys">${k.map(([a, d]) => `<span>${d}</span><span>${a.split(' / ').map(z => `<span class="kbd">${z}</span>`).join(' ')}</span>`).join('')}</div></div>`;
 },
 },
@@ -3642,6 +3658,224 @@ const ins = list.filter(a => a.installed);
 setHTML(m.r.dek, ins.length ? `${ins.map(a => esc(a.name)).join('、')} 已安装${ins.some(a => a.media_count != null) ? `，媒体共 ${F.bytesStr(ins.reduce((s, a) => s + (+a.media_size || 0), 0))}` : ''}。统计每 10 分钟后台更新一次。` : '本机未安装相册 / 影视 / 音乐。');
 },
 });
+const vmOk = d => !!(d && d.available);
+const vmRun = v => v.state === 'running' || v.state === 'blocked';
+const vmName = v => v.title || v.name;
+const vmMemUsed = v => ok(v.mem_guest_used) ? +v.mem_guest_used : ok(v.mem_rss) ? +v.mem_rss : null;
+const vmSpec = v => `${v.vcpus || '?'} 核 · ${F.bytesStr(v.mem_max)}`;
+const vmSub = v => (v.os || (v.title ? v.name : '')) ? `${v.os || v.name} · ${vmSpec(v)}` : vmSpec(v);
+const VMs = {
+filter: 'all', q: '', pending: {},
+PEND: { start: '正在开机…', shutdown: '正在关机…', reboot: '正在重启…', suspend: '正在挂起…', resume: '正在恢复…', destroy: '正在强制关机…' },
+DONE: { start: '已开机', shutdown: '已关机', reboot: '已发送重启', suspend: '已挂起', resume: '已恢复', destroy: '已强制关机' },
+VERB: { start: '开机', shutdown: '关机', reboot: '重启', suspend: '挂起', resume: '恢复', destroy: '强制关机' },
+ICON: { start: 'play', shutdown: 'power', reboot: 'restart', suspend: 'pause', resume: 'play', destroy: 'bolt' },
+ARM: ['shutdown', 'reboot', 'suspend', 'destroy'],
+UNDO: { start: 'shutdown', shutdown: 'start', destroy: 'start', suspend: 'resume', resume: 'suspend' },
+list() { return vmOk(S.vms) ? S.vms.vms || [] : []; },
+find(u) { return this.list().find(v => v.uuid === u) || null; },
+setFilter(f) { this.filter = f; const m = MODS.vms; if (m && m.seg) m.seg.set(f); this.apply(); },
+reached(a, v) { return !v ? a === 'destroy' : a === 'start' || a === 'resume' ? vmRun(v) : a === 'suspend' ? v.state === 'paused' : a === 'shutdown' || a === 'destroy' ? !v.running : true; },
+async refreshUntil(uuid, a) {
+const waits = a === 'shutdown' ? [1500, 3000, 5000, 8000, 12000, 15000, 15000] : a === 'reboot' ? [1500] : [800, 1500, 3000, 5000];
+for (const ms of waits) {
+await new Promise(r => setTimeout(r, ms));
+try { S.vms = await API.get('/api/vms'); feedVms(S.vms); } catch (e) { continue; }
+if (this.reached(a, this.find(uuid))) return true;
+}
+return false;
+},
+async act(uuid, name, a, btn) {
+if (!uuid || this.pending[uuid] || !this.VERB[a]) return;
+if (this.ARM.includes(a) && btn && btn.dataset.armed !== '1') {
+btn.dataset.armed = '1'; btn.classList.add('armed'); btn._old = btn.innerHTML; btn.innerHTML = `${ic(this.ICON[a])}确认${this.VERB[a]}？`;
+btn.setAttribute('aria-label', `确认${this.VERB[a]} ${name}`);
+clearTimeout(btn._t); btn._t = setTimeout(() => { if (btn.isConnected) { btn.dataset.armed = ''; btn.classList.remove('armed'); btn.innerHTML = btn._old; } }, 3000);
+return;
+}
+this.pending[uuid] = a; renderNow();
+try {
+const j = await API.post('/api/vm/action', { uuid, action: a });
+if (!j.ok) throw new Error(j.error || '未知错误');
+const done = await this.refreshUntil(uuid, a);
+delete this.pending[uuid]; renderNow();
+if (!done && a === 'shutdown') { toast(`已向 ${name} 发送关机信号，但它仍在运行：客户机可能未响应 ACPI，可在详情中强制关机`, { icon: 'alert', ms: 8000, action: '详情', onAction: () => openSheet('vm/' + uuid) }); return; }
+const undo = this.UNDO[a];
+toast(`${name} ${this.DONE[a]}`, undo ? { action: '撤销', onAction: () => this.act(uuid, name, undo) } : {});
+} catch (e) {
+delete this.pending[uuid]; renderNow();
+toast(`${name} ${this.VERB[a]}失败：${String(e.message).slice(0, 80)}`, { icon: 'alert', ms: 6000 });
+}
+},
+apply() {
+const m = MODS.vms; if (!m || !m.rows) return;
+const q = this.q.trim().toLowerCase(); let shown = 0;
+this.list().forEach(v => {
+const row = m.rows[v.uuid]; if (!row) return;
+const okQ = !q || [v.title, v.name, v.os, v.description, (v.ips || []).join(' ')].join(' ').toLowerCase().includes(q);
+const okF = this.filter === 'all' || (this.filter === 'running' ? v.running : !v.running);
+row.hidden = !(okQ && okF); if (!row.hidden) shown++;
+});
+const any = this.list().length;
+m.x.empty.hidden = !any || shown > 0; m.x.head.hidden = !any || shown === 0;
+setHTML(m.x.emptyT, q ? `没有匹配「${esc(this.q)}」的虚拟机` : this.filter === 'stopped' ? '没有未运行的虚拟机' : '没有运行中的虚拟机');
+},
+};
+function vmActs(v) {
+if (vmRun(v)) return [['reboot', 'shutdown'], ['reboot', 'shutdown', 'suspend', 'destroy']];
+if (v.state === 'paused') return [['resume'], ['resume', 'destroy']];
+if (v.state === 'shutdown') return [[], ['destroy']];
+if (v.state === 'shutoff' || v.state === 'crashed') return [['start'], ['start']];
+return [[], []];
+}
+const vmActBtns = v => {
+const ids = `data-id="${esc(v.uuid)}" data-name="${esc(vmName(v))}"`;
+return vmActs(v)[0].map(a => `<button class="act${a === 'shutdown' ? ' danger' : a === 'start' || a === 'resume' ? ' go' : ''}" type="button" data-act="${a}" ${ids} title="${VMs.VERB[a]}" aria-label="${VMs.VERB[a]} ${esc(vmName(v))}">${ic(VMs.ICON[a])}</button>`).join('');
+};
+const vmRateOk = v => vmRun(v) && ok(v.rx_rate) && ok(v.rd_rate);
+function vmIoHTML(v, a, b, la, lb) {
+if (!vmRun(v)) return '<span class="faint">—</span>';
+if (!vmRateOk(v)) return '<span class="faint" title="需要两次采样才能算出速率">采样中…</span>';
+return `<b>${la}${esc(F.rateStr(v[a]))}</b><small>${lb}${esc(F.rateStr(v[b]))}</small>`;
+}
+const vmNoNic = v => !(v.nics || []).length;
+const vmNetHTML = v => vmRun(v) && vmNoNic(v) ? '<span class="faint">无网卡</span>' : vmIoHTML(v, 'rx_rate', 'tx_rate', '<i class="ar dn">↓</i>', '<i class="ar up">↑</i>');
+const vmDiskHTML = v => vmIoHTML(v, 'rd_rate', 'wr_rate', '<i class="ar">读</i>', '<i class="ar">写</i>');
+const vmIpsHTML = (v, max = 2) => {
+const ips = v.ips || [];
+if (!ips.length) return `<span class="faint" style="font-size:12px">${vmNoNic(v) ? '无网卡' : vmRun(v) ? '未获取到 IP' : '—'}</span>`;
+return ips.slice(0, max).map(ip => `<span class="port">${esc(ip)}</span>`).join('') + (ips.length > max ? `<span class="port">+${ips.length - max}</span>` : '');
+};
+const vmUpHTML = v => VMs.pending[v.uuid] ? `<span class="pending-t">${VMs.PEND[VMs.pending[v.uuid]]}</span>` : vmRun(v) ? esc(ok(v.uptime) ? F.dur(v.uptime) : '运行中') : `<span class="faint">${esc(v.state_zh || v.state)}</span>`;
+function feedVms(d) {
+if (!vmOk(d) || S._vmFed === d.sampled_at) return; S._vmFed = d.sampled_at;
+(d.vms || []).forEach(v => { const b = S.vmBuf[v.uuid] || (S.vmBuf[v.uuid] = []); push(b, vmRun(v) ? (+v.cpu || 0) : 0, 36); });
+}
+defineModule({
+id: 'vms', page: 'vms', kicker: 'VIRTUAL MACHINES', title: '虚拟机', big: true,
+actions: m => {
+const f = mount(`<label class="field">${ic('search')}<input type="search" placeholder="搜索名称、备注或 IP" aria-label="搜索虚拟机"></label>`);
+f.querySelector('input').addEventListener('input', e => { VMs.q = e.target.value; VMs.apply(); });
+m.seg = makeSeg([['all', '全部'], ['running', '运行中'], ['stopped', '未运行']], VMs.filter, v => { VMs.filter = v; VMs.apply(); }, 'sm');
+return [f, m.seg];
+},
+build(body, m) {
+body.innerHTML = `<div class="stat-cells dk-sum">
+<div class="stat-cell"><div class="eyebrow">运行中</div><div class="dnum"><span class="dm" data-ref="sRun"></span></div><div class="sub" data-ref="sRunT"></div></div>
+<div class="stat-cell"><div class="eyebrow">虚拟机 CPU</div><div class="dnum"><span class="dm" data-ref="sCpu"></span><span class="unit">%</span></div><div class="sub" data-ref="sCpuT"></div></div>
+<div class="stat-cell"><div class="eyebrow">已分配 vCPU</div><div class="dnum"><span class="dm" data-ref="sVcpu"></span><span class="unit">核</span></div><div class="sub" data-ref="sVcpuT"></div></div>
+<div class="stat-cell"><div class="eyebrow">已分配内存</div><div class="dnum"><span class="dm" data-ref="sMem"></span><span class="unit" data-ref="sMemU"></span></div><div class="sub" data-ref="sMemT"></div></div>
+</div>
+<div class="card ctr-list"><div class="ctr vm ctr-head" data-ref="head" hidden><span>虚拟机</span><span>IP 地址</span><span>CPU · 近几分钟</span><span>内存</span><span class="vm-io">磁盘读写</span><span class="ctr-net">网络</span><span class="ctr-up">运行时长</span><span></span></div><div data-ref="list"></div>
+<div class="empty" data-ref="empty" hidden><svg class="art" viewBox="0 0 120 84" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="26" y="12" width="68" height="44" rx="6" stroke-dasharray="3 4"/><path d="M50 70h20M60 56v14"/><circle cx="92" cy="62" r="9"/><path d="m98.5 68.5 7 7"/></svg><b data-ref="emptyT">没有匹配的虚拟机</b><span>换个关键词，或查看全部虚拟机。</span><button class="btn" type="button" data-ref="clear">清除筛选</button></div>
+<div data-ref="na"></div></div>
+<p class="sub vm-note">关机发送 ACPI 信号，由客户机自行关闭；客户机无响应时可在详情中「强制关机」（相当于直接断电）。内存优先显示客户机自报的已用量（需 virtio balloon 驱动），否则显示宿主上的实际占用。</p>`;
+m.x = collect(body); m.rows = {};
+m.x.clear.addEventListener('click', () => { VMs.q = ''; $('input', m.r.actions).value = ''; VMs.setFilter('all'); });
+m.x.list.addEventListener('click', e => {
+const a = e.target.closest('[data-act]');
+if (a) { e.stopPropagation(); VMs.act(a.dataset.id, a.dataset.name, a.dataset.act, a); return; }
+const row = e.target.closest('.ctr[data-uuid]'); if (row) openSheet('vm/' + row.dataset.uuid);
+});
+m.x.list.addEventListener('keydown', e => { const row = e.target.closest('.ctr[data-uuid]'); if (e.key === 'Enter' && row && e.target === row) openSheet('vm/' + row.dataset.uuid); });
+},
+update(o, m) {
+const d = S.vms; const x = m.x;
+if (!d) { setHTML(x.na, `<div class="empty"><span class="spin"></span><span>正在读取虚拟机…</span></div>`); return; }
+const avail = vmOk(d), vs = avail ? d.vms || [] : [], run = vs.filter(v => v.running);
+setHTML(x.na, avail ? (vs.length ? '' : `<div class="empty">${ic('vm')}<b>还没有虚拟机</b><span>在飞牛「虚拟机」中创建的虚拟机会出现在这里。</span></div>`)
+: `<div class="empty">${ic('vm')}<b>${d.installed ? '无法连接虚拟机服务' : '未检测到虚拟机功能'}</b><span>${esc(d.error || '')}</span></div>`);
+const sig = vs.map(v => v.uuid + v.name + v.title).join();
+if (m.sig !== sig) {
+m.sig = sig; x.list.innerHTML = ''; m.rows = {};
+vs.forEach(v => {
+const row = mount(`<div class="ctr vm" data-uuid="${esc(v.uuid)}" tabindex="0" role="button" aria-label="虚拟机 ${esc(vmName(v))}">
+<div class="ctr-name"><span class="sdot" data-ref="dot"></span><div class="t"><b title="${esc(vmName(v))}">${esc(vmName(v))}</b><small data-ref="spec"></small></div></div>
+<div class="ports" data-ref="ips"></div>
+<div class="ctr-cpu"><div class="spk" data-ref="sp"></div><b data-ref="cpu"></b></div>
+<div class="ctr-mem"><b data-ref="mem"></b><small data-ref="memp"></small></div>
+<div class="ctr-net vm-io" data-ref="io"></div>
+<div class="ctr-net" data-ref="net"></div>
+<div class="ctr-up" data-ref="up"></div>
+<div class="acts" data-ref="acts"></div>
+</div>`);
+row._sp = makeSpark(); row._r.sp.append(row._sp);
+m.rows[v.uuid] = row; x.list.append(row);
+});
+}
+vs.forEach(v => {
+const row = m.rows[v.uuid]; if (!row) return; const r = row._r, pend = VMs.pending[v.uuid], on = vmRun(v), mu = vmMemUsed(v), bb = S.vmBuf[v.uuid] || [];
+setCls(row, 'ctr vm', (v.running ? '' : 'off') + (pend ? ' pending' : ''));
+setCls(r.dot, 'sdot', pend || v.state === 'shutdown' ? 'busy' : on ? '' : 'off');
+setText(r.spec, vmSub(v));
+setHTML(r.ips, vmIpsHTML(v));
+setText(r.cpu, on && ok(v.cpu) ? F.d1(v.cpu) + '%' : '—');
+setText(r.mem, on && mu != null ? F.bytesStr(mu) : '—'); setText(r.memp, on && ok(v.mem) ? '共 ' + F.bytesStr(v.mem) : '');
+row._sp.set([{ values: on && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...bb), live: on ? 'ink' : 'none' });
+setHTML(r.io, vmDiskHTML(v)); setHTML(r.net, vmNetHTML(v));
+setHTML(r.up, vmUpHTML(v));
+setHTML(r.acts, pend ? '<span class="spin" aria-label="处理中"></span>' : vmActBtns(v));
+});
+const cores = run.reduce((a, v) => a + (+v.cpu_cores || 0), 0), vcpu = run.reduce((a, v) => a + (+v.vcpus || 0), 0), mem = run.reduce((a, v) => a + (+v.mem || 0), 0);
+const hc = o && o.cpu && o.cpu.cores, T = o && o.mem && o.mem.total;
+dot(x.sRun).set(avail ? `${run.length}/${vs.length}` : '--'); setText(x.sRunT, !avail ? '虚拟机服务不可用' : vs.length - run.length ? `${vs.length - run.length} 个未运行` : vs.length ? '全部运行中' : '暂无虚拟机');
+dnum(x.sCpu, avail && hc ? cores / hc * 100 : null, F.d1); setText(x.sCpuT, avail ? `约 ${cores.toFixed(1)} 核${hc ? ` · 共 ${hc} 核` : ''}` : '--');
+dnum(x.sVcpu, avail ? vcpu : null); setText(x.sVcpuT, avail && hc ? `宿主 ${hc} 核${vcpu > hc ? ' · 已超分' : ''}` : '运行中的虚拟机');
+dnumU(x.sMem, x.sMemU, avail ? mem : null, F.bytes); setText(x.sMemT, avail && T ? `占物理内存 ${F.int(mem / T * 100)}%` : '--');
+setHTML(m.r.dek, avail ? `<b>${run.length}</b> 个运行中 · <b>${vs.length - run.length}</b> 个未运行　KVM 硬件加速${d.kvm ? '可用' : '<span class="st-warn">不可用</span>'}` : esc(d.error || '虚拟机服务不可用'));
+VMs.apply();
+},
+});
+SHEETS.vm = {
+icon: () => 'vm', title: u => { const v = VMs.find(u); return v ? vmName(v) : '虚拟机'; },
+sub: (o, u) => { const v = VMs.find(u); return v ? vmSub(v) : ''; },
+build(b, u, ctx) {
+if (!VMs.find(u)) {
+if (!S.vms) { ctx.retry = true; b.innerHTML = `<div class="empty"><span class="spin"></span><span>正在读取虚拟机…</span></div>`; Poll.run('vms'); return; }
+b.innerHTML = `<div class="empty"><b>未找到该虚拟机</b><span>它可能已被删除，或虚拟机服务当前不可用。</span></div>`; return;
+}
+b.innerHTML = `<div class="sheet-hero"><div><div class="eyebrow">CPU</div><div class="dnum"><span class="dm" data-ref="cpu"></span><span class="unit">%</span></div></div><div style="text-align:right"><div class="eyebrow" data-ref="memL">内存</div><div class="dnum sec"><span class="dm" data-ref="mem"></span><span class="unit" data-ref="memU"></span></div></div></div>
+<div class="ctr-acts" data-ref="acts"></div>
+<div class="card chart-card"><div class="chart-head"><div class="chart-title">CPU · 近几分钟</div><span data-ref="state"></span></div><div style="height:64px" data-ref="sp"></div></div>
+${sec('实时读写', '<span class="faint">相邻两次采样均值</span>')}<div class="stat-cells ctr-rates"><div class="stat-cell"><div class="eyebrow">磁盘读</div><div class="dnum"><span class="dm" data-ref="rd"></span><span class="unit" data-ref="rdU"></span></div></div><div class="stat-cell"><div class="eyebrow">磁盘写</div><div class="dnum"><span class="dm" data-ref="wr"></span><span class="unit" data-ref="wrU"></span></div></div><div class="stat-cell"><div class="eyebrow"><i class="ar dn">↓</i>网络接收</div><div class="dnum"><span class="dm" data-ref="rx"></span><span class="unit" data-ref="rxU"></span></div></div><div class="stat-cell"><div class="eyebrow"><i class="ar up">↑</i>网络发送</div><div class="dnum"><span class="dm" data-ref="tx"></span><span class="unit" data-ref="txU"></span></div></div></div>
+${sec('网卡')}<div data-ref="nics"></div>
+${sec('磁盘')}<div data-ref="disks"></div>
+${sec('详情')}<div data-ref="kv"></div>`;
+const x = collect(b), sp = makeSpark(); x.sp.append(sp);
+x.acts.addEventListener('click', e => { const btn = e.target.closest('[data-act]'); if (btn) VMs.act(btn.dataset.id, btn.dataset.name, btn.dataset.act, btn); });
+return () => {
+const v = VMs.find(u); if (!v) return;
+const pend = VMs.pending[v.uuid], on = vmRun(v), mu = vmMemUsed(v), rOk = vmRateOk(v);
+dnum(x.cpu, on ? v.cpu : null, F.d1); dnumU(x.mem, x.memU, on ? mu : null, F.bytes);
+setText(x.memL, on && ok(v.mem_guest_used) ? '内存 · 客户机已用' : on && ok(v.mem_rss) ? '内存 · 宿主占用' : '内存');
+setHTML(x.state, pend ? `<span class="pill">${VMs.PEND[pend]}</span>` : on ? '<span class="pill ok"><span class="dot"></span>运行中</span>' : `<span class="pill">${esc(v.state_zh || v.state)}</span>`);
+const ids = `data-id="${esc(v.uuid)}" data-name="${esc(vmName(v))}"`;
+setHTML(x.acts, pend ? `<span class="spin"></span><span class="pending-t">${VMs.PEND[pend]}</span>` : vmActs(v)[1].map(a => `<button class="btn${a === 'start' || a === 'resume' ? ' primary' : a === 'destroy' || a === 'shutdown' ? ' danger' : ''}" type="button" data-act="${a}" ${ids}>${ic(VMs.ICON[a])}${VMs.VERB[a]}</button>`).join('') || '<span class="faint">当前状态没有可用操作</span>');
+const bb = S.vmBuf[v.uuid]; sp.set([{ values: on && bb && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...(bb || [0])), live: on ? 'ink' : 'none' });
+dnumU(x.rd, x.rdU, rOk ? +v.rd_rate : null, F.rate); dnumU(x.wr, x.wrU, rOk ? +v.wr_rate : null, F.rate);
+dnumU(x.rx, x.rxU, rOk && !vmNoNic(v) ? +v.rx_rate : null, F.rate); dnumU(x.tx, x.txU, rOk && !vmNoNic(v) ? +v.tx_rate : null, F.rate);
+const nics = v.nics || [], disks = v.disks || [];
+setHTML(x.nics, nics.length ? rowsCard(nics.map(n => `<div class="row-i" style="grid-template-columns:minmax(0,1fr) auto"><div style="min-width:0"><b class="mono" style="font-weight:600">${esc(n.mac || '—')}</b><div class="sub">${esc([n.type === 'bridge' ? '桥接' : n.type === 'network' ? '虚拟网络' : n.type === 'direct' ? '直通 macvtap' : n.type, n.source, n.model, n.target].filter(Boolean).join(' · '))}</div></div><span class="ports" style="justify-content:flex-end">${(n.ips || []).length ? n.ips.map(ip => `<span class="port">${esc(ip)}</span>`).join('') : `<span class="faint" style="font-size:12px">${on ? '未获取到 IP' : '—'}</span>`}</span></div>`).join(''))
+: `<div class="card pad">${emptyHTML('没有网卡')}</div>`);
+setHTML(x.disks, disks.length ? rowsCard(disks.map(d => `<div class="row-i" style="grid-template-columns:minmax(0,1fr) auto"><div style="min-width:0"><b style="font-weight:600">${esc(d.dev || '—')}</b> <span class="faint">${esc([d.device === 'cdrom' ? '光驱' : d.device === 'disk' ? '' : d.device, d.bus, d.readonly ? '只读' : ''].filter(Boolean).join(' · '))}</span><div class="cmd-line" title="${esc(d.path)}">${esc(d.path || '（无介质）')}</div></div><span class="tnum" style="text-align:right">${ok(d.capacity) ? `<b>${esc(F.bytesStr(d.capacity))}</b>${ok(d.allocation) ? `<div class="sub">实占 ${esc(F.bytesStr(d.allocation))}</div>` : ''}` : '<span class="faint">—</span>'}</span></div>`).join(''))
+: `<div class="card pad">${emptyHTML('没有磁盘')}</div>`);
+const gfx = (v.graphics || []).filter(g => g.port || g.socket).map(g => `${esc(String(g.type).toUpperCase())} ${g.port ? `:${esc(g.port)}${g.listen ? ` · ${esc(g.listen)}` : ''}` : '· 本机套接字'}`).join('<br>');
+setHTML(x.kv, kvHTML([
+['内部名称', `<span class="mono">${esc(v.name)}</span>`], ['UUID', `<span class="mono">${esc(v.uuid)}</span>`],
+['状态', esc(v.state_zh || v.state)], ['已运行', on && ok(v.uptime) ? esc(F.dur(v.uptime)) : '<span class="faint">—</span>'],
+['vCPU', esc(v.vcpus || '--') + ' 核' + (on && ok(v.cpu_cores) ? `<div class="sub">当前约 ${F.d2(v.cpu_cores)} 核</div>` : '')],
+['内存', esc(F.bytesStr(v.mem_max)) + (on && ok(v.mem) && v.mem !== v.mem_max ? `<div class="sub">当前分配 ${esc(F.bytesStr(v.mem))}</div>` : '')],
+['客户机已用', on && ok(v.mem_guest_used) ? esc(F.bytesStr(v.mem_guest_used)) : '<span class="faint">需 virtio balloon 驱动</span>'],
+['宿主占用', on && ok(v.mem_rss) ? esc(F.bytesStr(v.mem_rss)) : '<span class="faint">—</span>'],
+['系统', dash(v.os)], ['架构 / 机型', dash([v.arch, v.machine].filter(Boolean).join(' · '))], ['固件', dash(v.firmware)],
+['开机自启', v.autostart ? '已开启' : '未开启'],
+['控制台', gfx || `<span class="faint">${on ? '未启用' : '—'}</span>`],
+['Guest Agent', v.agent ? (v.agent_connected ? '<span class="st-ok">已连接</span>' : '未连接') : '<span class="faint">未配置</span>'],
+['累计读写', on && ok(v.rd_bytes) ? `磁盘 读 ${F.bytesStr(v.rd_bytes)} · 写 ${F.bytesStr(v.wr_bytes)}<div class="sub">${vmNoNic(v) ? '' : `网络 ↓ ${F.bytesStr(v.rx_bytes)} · ↑ ${F.bytesStr(v.tx_bytes)} · `}自本次开机</div>` : '<span class="faint">—</span>'],
+].concat(v.description ? [['备注', esc(v.description)]] : [])));
+};
+},
+};
 const SECRET_KEYS = ['auth_password', 'old_password'];
 const stripSecrets = c => { const o = Object.assign({}, c || {}); SECRET_KEYS.forEach(k => delete o[k]); return o; };
 const pwSet = () => !!(S.cfg && (S.cfg.auth_password_set != null ? S.cfg.auth_password_set : S.cfg.auth_has_password));
@@ -3804,7 +4038,7 @@ uiItem('fontScale', '字体大小', 'seg', { options: [[0.9, '较小'], [1, '标
 uiItem('motion', '动效', 'toggle', { hint: '系统开启“减少动态效果”时始终关闭' }),
 { k: 'uiSync', label: '界面设置同步', type: 'action', button: '立即同步', hint: () => `外观、布局与阈值保存在 NAS：<span class="mono">${esc((S.cfg && S.cfg.ui_file) || '数据目录/ui.json')}</span>，换设备或清缓存后自动恢复`, run: async b => { b.disabled = true; const okk = await postUI(); b.disabled = false; toast(okk ? '已同步到 NAS' : '同步失败，请检查连接', okk ? {} : { icon: 'alert' }); } },
 { k: 'hiddenMods', label: '已隐藏的版块', type: 'info', html: hiddenHTML },
-{ k: 'resetLayout', label: '布局', type: 'action', button: '恢复默认布局', run: () => { resetLayout('overview'); resetLayout('docker'); toast('已恢复默认布局'); syncSettings(); } },
+{ k: 'resetLayout', label: '布局', type: 'action', button: '恢复默认布局', run: () => { Object.keys(LAYOUT_DEFAULT).forEach(resetLayout); toast('已恢复默认布局'); syncSettings(); } },
 { k: 'resetUI', label: '一键初始化界面', type: 'action', button: '恢复默认界面', danger: true, hint: '外观、主色、字号、布局与隐藏状态恢复默认（提醒阈值保持不变）', run: resetUI },
 ] },
 { id: 'auth', title: '登录口令', icon: 'lock', desc: '开启后，访问飞牛监控需要先输入口令。', custom: renderAuth },
@@ -3822,7 +4056,7 @@ const b = e.target.closest('[data-restore]'); if (!b) return;
 const v = b.dataset.restore;
 if (v === '*') Object.keys(UI.hidden).forEach(p => { UI.hidden[p] = []; });
 else { const [p, id] = v.split(':'); UI.hidden[p] = (UI.hidden[p] || []).filter(x => x !== id); }
-applyLayout('overview'); applyLayout('docker'); saveUI(); syncSettings(); toast('已恢复显示');
+Object.keys(LAYOUT_DEFAULT).forEach(applyLayout); saveUI(); syncSettings(); toast('已恢复显示');
 });
 function renderIgnored(card) {
 card.addEventListener('click', e => {
@@ -4117,10 +4351,12 @@ const Pal = {
 items: [], sel: 0, shown: [],
 build() {
 const it = [], add = (g, label, icon, run, hint = '', kw = '') => it.push({ g, label: String(label), icon, run, hint: String(hint), kw: String(kw) });
-[['overview', '总览', 'home'], ['docker', '容器 · 端口', 'box'], ['settings', '设置', 'gear']].forEach(([p, l, i], k) => add('页面', l, i, () => go(p), String(k + 1), p));
+const PI = { overview: ['总览', 'home'], docker: ['容器 · 端口', 'box'], vms: ['虚拟机', 'vm'], settings: ['设置', 'gear'] };
+navPages().forEach((p, k) => add('页面', PI[p][0], PI[p][1], () => go(p), String(k + 1), p));
 [['health', '健康检查', 'shield'], ['cpu', '处理器', 'cpu'], ['mem', '内存', 'mem'], ['storage', '存储', 'storage'], ['net', '网络', 'net'], ['temp', '温度与散热', 'temp'], ['power', '能耗', 'bolt']].forEach(([k, l, i]) => add('详情', l, i, () => { if (S.page !== 'overview') go('overview'); openSheet(k); }, '', k));
 disksOf(S.o).forEach(d => add('硬盘', `${d.name} · ${vendorModel(d)}`, diskIcon(d), () => { if (S.page !== 'overview') go('overview'); openSheet('disk/' + encodeURIComponent(d.name)); }, isSleep(d) ? '休眠中' : smartState(d).lv === 'warn' ? '需留意' : '', (d.serial || '') + ' ' + KIND_TXT[diskKind(d)]));
 Docker.list().forEach(c => add('容器', c.name, 'box', () => { if (S.page !== 'docker') go('docker'); openSheet('ctr/' + encodeURIComponent(c.name)); }, ctrRun(c) ? '运行中' : '未运行', c.image + ' ' + c.ports));
+VMs.list().forEach(v => add('虚拟机', vmName(v), 'vm', () => { if (S.page !== 'vms') go('vms'); openSheet('vm/' + v.uuid); }, v.state_zh || '', v.name + ' ' + (v.ips || []).join(' ')));
 SET_SCHEMA.forEach(g => (g.items || []).forEach(x => add('设置', x.label, g.icon, () => focusSetting(x.k), g.title, (x.help || '') + ' ' + (typeof x.hint === 'string' ? x.hint : ''))));
 SET_SCHEMA.filter(g => g.custom).forEach(g => add('设置', g.title, g.icon, () => focusGroup(g.id), '分组', { auth: '密码 登录 口令 安全', update: '升级 版本 更新', thresholds: '阈值 告警 提醒 温度 cpu 内存 容量', data: '导出 csv 报告 目录', about: '关于 作者 github' }[g.id] || ''));
 add('操作', '切换浅色 / 深色', 'moon', toggleTheme, 'T'); add('操作', '编辑布局', 'layout', () => setEditing(true), 'E'); add('操作', '刷新全部数据', 'refresh', globalRefresh); add('操作', '全屏 / 退出全屏', 'expand', () => S.fsToggle && S.fsToggle(), 'F11'); add('操作', '生成健康报告', 'shield', () => doDownload('/api/report?format=html'), 'HTML'); add('操作', '键盘快捷键', 'key', () => openSheet('keys'), '?');
@@ -4152,7 +4388,15 @@ if (e.key === 'Enter') { e.preventDefault(); Pal.run(Pal.sel); }
 $('#palList').addEventListener('click', e => { const b = e.target.closest('[data-i]'); if (b) Pal.run(+b.dataset.i); });
 $('#palette').addEventListener('click', e => { if (e.target.id === 'palette') Pal.close(); });
 $('#btnSearch').onclick = () => Pal.open();
-const PAGES = ['overview', 'docker', 'settings'];
+const PAGES = ['overview', 'docker', 'vms', 'settings'];
+const PAGE_TITLE = { overview: '总览', docker: '容器', vms: '虚拟机', settings: '设置' };
+const navPages = () => PAGES.filter(p => p !== 'vms' || S.vmTab);
+function setVmTab(on) {
+on = !!on; if (S.vmTab === on && $('#pageSeg [data-page="vms"]').hidden === !on) return;
+S.vmTab = on; store.set('vmTab', on);
+$$('#pageSeg [data-page="vms"], #bottomNav [data-page="vms"]').forEach(b => { b.hidden = !on; });
+placeThumb($('#pageSeg'));
+}
 function parseHash() {
 const h = location.hash.replace(/^#\/?/, ''), [p, ...rest] = h.split('/');
 return { page: PAGES.includes(p) ? p : 'overview', sheet: rest.join('/') || null };
@@ -4170,7 +4414,7 @@ placeThumb($('#pageSeg'));
 $('#btnEdit').style.visibility = p === 'settings' ? 'hidden' : '';
 if (p === 'settings') { if (S.editing) setEditing(false); buildSettings(); syncSettings(); }
 if (changed) { scrollTo(0, 0); renderNow(); onPageChange(p); }
-document.title = (p === 'overview' ? '总览' : p === 'docker' ? '容器' : '设置') + ' · 飞牛监控';
+document.title = PAGE_TITLE[p] + ' · 飞牛监控';
 }
 function go(p) { if (S.sheet) closeSheet(true); showPage(p); setHash(false); }
 function route() {
@@ -4206,7 +4450,7 @@ return;
 if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
 if ($('#palette').classList.contains('on')) return;
 const k = e.key;
-if (k === '1' || k === '2' || k === '3') go(PAGES[+k - 1]);
+if (/^[1-9]$/.test(k) && navPages()[+k - 1]) go(navPages()[+k - 1]);
 else if (k === '/') { e.preventDefault(); Pal.open(); }
 else if (k === 'e' || k === 'E') setEditing(!S.editing);
 else if (k === 't' || k === 'T') toggleTheme();
@@ -4239,7 +4483,7 @@ if (!(+raw.layoutVersion >= LAYOUT_VERSION)) { n.layout = UI.layout; n.hidden = 
 setThresholds(n.thresholds);
 Object.assign(UI, n, { thresholds: TH });
 store.set('ui', uiPayload());
-applyUIAll(); applyLayout('overview'); applyLayout('docker');
+applyUIAll(); Object.keys(LAYOUT_DEFAULT).forEach(applyLayout);
 if (MODS.trends && MODS.trends.seg) { MODS.trends.seg.set(UI.range); if (MODS.trends.range && MODS.trends.range !== UI.range) MODS.trends.load(); }
 syncSettings();
 }
@@ -4324,6 +4568,11 @@ if (S.online === false || !S.o) { if (S.fails >= 2) S.online = false; setStatus(
 }
 }, () => S.online === false ? Math.min(30000, 3000 * Math.pow(1.6, S.fails)) : S.page === 'overview' ? 5000 : 15000);
 Poll.add('docker', async () => { S.docker = await API.get('/api/docker'); dockerAt = Date.now(); feedDocker(S.docker); renderNow(); }, 10000, () => S.page === 'docker' || sheetIs('ctr'));
+Poll.add('vms', async () => {
+S.vms = await API.get('/api/vms'); feedVms(S.vms); if (S.vms.installed) setVmTab(true);
+if (sheetCtx && sheetCtx.retry) { const k = sheetCtx.key; sheetCtx.key = ''; openSheet(k, true); }
+renderNow();
+}, 5000, () => S.page === 'vms' || sheetIs('vm'));
 Poll.add('ports', async () => { const j = await API.get('/api/ports'); S.ports = j.ports || {}; renderNow(); }, 30000, () => S.page === 'docker');
 Poll.add('apps', async () => { S.apps = await API.get('/api/apps'); renderNow(); }, 60000, () => S.page === 'docker');
 Poll.add('procs', async () => { S.procs = await API.get('/api/processes'); renderNow(); }, 15000, () => (S.page === 'overview' && modVis('procs')) || sheetIs('cpu', 'mem'));
@@ -4335,6 +4584,7 @@ Poll.add('hist', async () => { if (S.page === 'overview' && modVis('trends') && 
 Poll.add('config', async () => { await loadConfig(); syncSettings(); }, 1800000);
 function onPageChange(p) {
 if (p === 'docker') Poll.runAll(['docker', 'ports', 'apps']);
+if (p === 'vms') Poll.run('vms');
 if (p === 'overview') Poll.runAll(['overview']);
 }
 function globalRefresh() {
@@ -4414,7 +4664,9 @@ addEventListener('resize', () => placeThumb($('#pageSeg')));
 applyUIAll();
 dmScan(document);
 Hero.build();
-applyLayout('overview'); applyLayout('docker');
+Object.keys(LAYOUT_DEFAULT).forEach(applyLayout);
+setVmTab(S.vmTab);
+API.get('/api/vms?probe=1').then(j => setVmTab(j && j.installed)).catch(() => {});
 if (MODS.monthly) MODS.monthly.el.hidden = true;
 setStatus();
 route();

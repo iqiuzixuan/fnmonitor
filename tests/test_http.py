@@ -106,7 +106,8 @@ class NoAuthTest(ServerTestCase):
     # ---- methods / bodies ----
     def test_get_on_state_changing_endpoints_405(self):
         for p in ("/api/update/install", "/api/update/download", "/api/update/download?to=nas&path=/tmp",
-                  "/api/config/save", "/api/auth/setup", "/api/auth/password", "/api/auth/logout", "/api/docker/action"):
+                  "/api/config/save", "/api/auth/setup", "/api/auth/password", "/api/auth/logout", "/api/docker/action",
+                  "/api/vm/action"):
             st, j, r, _ = self.get(p)
             self.assertEqual((st, r.getheader("Allow")), (405, "POST"), p)
             self.assertEqual(j["error"], "method_not_allowed")

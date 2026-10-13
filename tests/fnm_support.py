@@ -212,7 +212,7 @@ def cookie_of(resp):
 CONTRACT_ENDPOINTS = [
     "/api/overview", "/api/config", "/api/docker", "/api/history?metric=cpu&range=1h",
     "/api/traffic", "/api/power_stats", "/api/daily", "/api/monthly_summary", "/api/ui",
-    "/api/auth/config",
+    "/api/auth/config", "/api/vms",
 ]
 # Sub-trees whose content depends on the host hardware / platform (lists of disks, sensors…).
 # Only their own type is checked, not their inner keys.
@@ -221,6 +221,7 @@ OPAQUE_PATHS = {
                       "ports", "hardware", "raid", "raidcard", "fans", "apps", "sensors.temps", "sensors.fans",
                       "sensors.volts", "temp.disks", "cpu.per_core", "system"],
     "/api/docker": ["containers"],
+    "/api/vms": ["vms"],
     "/api/traffic": ["ifaces", "containers"],
     "/api/power_stats": ["disks", "realtime"],
 }

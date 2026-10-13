@@ -29,7 +29,7 @@ async function loadUI() {
       setThresholds(n.thresholds);
       Object.assign(UI, n, { thresholds: TH });
       store.set('ui', uiPayload());
-      applyUIAll(); applyLayout('overview'); applyLayout('docker');
+      applyUIAll(); Object.keys(LAYOUT_DEFAULT).forEach(applyLayout);
       if (MODS.trends && MODS.trends.seg) { MODS.trends.seg.set(UI.range); if (MODS.trends.range && MODS.trends.range !== UI.range) MODS.trends.load(); }
       syncSettings();
     }
@@ -120,6 +120,11 @@ Poll.add('overview', async () => {
   }
 }, () => S.online === false ? Math.min(30000, 3000 * Math.pow(1.6, S.fails)) : S.page === 'overview' ? 5000 : 15000);
 Poll.add('docker', async () => { S.docker = await API.get('/api/docker'); dockerAt = Date.now(); feedDocker(S.docker); renderNow(); }, 10000, () => S.page === 'docker' || sheetIs('ctr'));
+Poll.add('vms', async () => {
+  S.vms = await API.get('/api/vms'); feedVms(S.vms); if (S.vms.installed) setVmTab(true);
+  if (sheetCtx && sheetCtx.retry) { const k = sheetCtx.key; sheetCtx.key = ''; openSheet(k, true); }
+  renderNow();
+}, 5000, () => S.page === 'vms' || sheetIs('vm'));
 Poll.add('ports', async () => { const j = await API.get('/api/ports'); S.ports = j.ports || {}; renderNow(); }, 30000, () => S.page === 'docker');
 Poll.add('apps', async () => { S.apps = await API.get('/api/apps'); renderNow(); }, 60000, () => S.page === 'docker');
 Poll.add('procs', async () => { S.procs = await API.get('/api/processes'); renderNow(); }, 15000, () => (S.page === 'overview' && modVis('procs')) || sheetIs('cpu', 'mem'));
@@ -131,6 +136,7 @@ Poll.add('hist', async () => { if (S.page === 'overview' && modVis('trends') && 
 Poll.add('config', async () => { await loadConfig(); syncSettings(); }, 1800000);
 function onPageChange(p) {
   if (p === 'docker') Poll.runAll(['docker', 'ports', 'apps']);
+  if (p === 'vms') Poll.run('vms');
   if (p === 'overview') Poll.runAll(['overview']);
 }
 function globalRefresh() {
@@ -223,7 +229,9 @@ addEventListener('resize', () => placeThumb($('#pageSeg')));
 applyUIAll();
 dmScan(document);
 Hero.build();
-applyLayout('overview'); applyLayout('docker');
+Object.keys(LAYOUT_DEFAULT).forEach(applyLayout);
+setVmTab(S.vmTab);
+API.get('/api/vms?probe=1').then(j => setVmTab(j && j.installed)).catch(() => {});
 if (MODS.monthly) MODS.monthly.el.hidden = true;
 setStatus();
 route();

@@ -122,3 +122,13 @@ dd .diag-link { margin: 0; height: 24px; }
 .btn.sm { height: 30px; padding: 0 12px; font-size: var(--fs-xs); }
 /* 健康检查抽屉里动态插入的「需要处理 / 已忽略」分组，沿用抽屉直接子元素的间距 */
 [data-ref="probs"] > * + * { margin-top: var(--s4); }
+/* 虚拟机列表：沿用容器行样式，多一列磁盘读写（窄屏先隐藏） */
+.ctr.vm { grid-template-columns: minmax(180px, 1.5fr) minmax(120px, 1fr) 140px 100px 118px 118px 96px 80px; }
+.vm-note { margin: 14px 2px 0; }
+@media (max-width: 1120px) {
+  .ctr.vm { grid-template-columns: minmax(160px, 1.4fr) minmax(110px, 1fr) 130px 96px 112px 80px; }
+  .ctr.vm .vm-io { display: none; }
+}
+@media (max-width: 960px) {
+  .ctr.vm { grid-template-columns: minmax(0, 1fr) auto; }
+}

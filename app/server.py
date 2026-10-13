@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import urllib.request
@@ -3338,6 +3339,451 @@ def docker_action(container_id, action):
 
 
 # ---------------------------------------------------------------------------
+# 虚拟机（飞牛「虚拟机」基于 QEMU/KVM + libvirt，统一通过 virsh 命令行读取与操作）
+# ---------------------------------------------------------------------------
+# virsh domstats 的 state.state 枚举（virDomainState）
+VM_STATES = {0: "nostate", 1: "running", 2: "blocked", 3: "paused", 4: "shutdown",
+             5: "shutoff", 6: "crashed", 7: "pmsuspended"}
+VM_STATE_ZH = {"nostate": "未知", "running": "运行中", "blocked": "运行中", "paused": "已挂起",
+               "shutdown": "正在关机", "shutoff": "已关机", "crashed": "已崩溃", "pmsuspended": "已休眠"}
+VM_STATE_ORDER = {"running": 0, "blocked": 0, "paused": 1, "shutdown": 2, "pmsuspended": 3,
+                  "crashed": 4, "shutoff": 5, "nostate": 6}
+VM_LIVE_STATES = ("running", "blocked", "paused")   # 有 QEMU 进程、计数器在走的状态
+VM_ACTIONS = ("start", "shutdown", "reboot", "suspend", "resume", "destroy")
+_VM_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
+# libvirt XML 内存单位（缺省 KiB）
+_XML_MEM_UNITS = {"b": 1, "bytes": 1, "kb": 1000, "k": 1024, "kib": 1024, "mb": 1000 ** 2, "m": 1024 ** 2,
+                  "mib": 1024 ** 2, "gb": 1000 ** 3, "g": 1024 ** 3, "gib": 1024 ** 3, "tb": 1000 ** 4,
+                  "t": 1024 ** 4, "tib": 1024 ** 4}
+
+
+def virsh_path():
+    """virsh 可执行文件路径；应用服务的 PATH 可能不含 sbin 等目录，逐个常见目录兜底。"""
+    p = shutil.which("virsh")
+    if p:
+        return p
+    for d in ("/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin"):
+        f = os.path.join(d, "virsh")
+        if os.path.isfile(f) and os.access(f, os.X_OK):
+            return f
+    return ""
+
+
+def run_virsh(args, timeout=15):
+    """执行 virsh，返回 (stdout, stderr, returncode)。固定 LC_ALL=C，输出格式不随系统语言变化。"""
+    exe = virsh_path()
+    if not exe:
+        return "", "未找到 virsh", -1
+    env = dict(os.environ, LC_ALL="C", LANG="C")
+    try:
+        r = subprocess.run([exe] + list(args), shell=False, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        return r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        return "", "virsh 执行超时", -1
+    except Exception as e:
+        return "", str(e), -1
+
+
+def virsh_error_text(stderr):
+    """virsh 报错去掉 'error: ' 前缀、多行合并，限制长度。"""
+    lines = [re.sub(r"^error:\s*", "", x.strip()) for x in (stderr or "").splitlines() if x.strip()]
+    return "；".join(lines)[-300:]
+
+
+def parse_domstats(text):
+    """解析 `virsh domstats --raw` → [(域名, {键: 值字符串})]，保持输出顺序。"""
+    out, cur = [], None
+    for line in (text or "").splitlines():
+        if line.startswith("Domain: "):
+            name = line[len("Domain: "):].strip()
+            if len(name) >= 2 and name[0] == name[-1] == "'":
+                name = name[1:-1]
+            cur = {}
+            out.append((name, cur))
+        elif cur is not None and "=" in line:
+            k, _, v = line.strip().partition("=")
+            cur[k] = v
+    return out
+
+
+def _stat_int(st, key):
+    try:
+        return int(st[key])
+    except Exception:
+        return None
+
+
+def domstats_state(st):
+    return VM_STATES.get(_stat_int(st, "state.state"), "nostate")
+
+
+def domstats_counters(st):
+    """累计计数 (cpu 纳秒, 磁盘读字节, 磁盘写字节, 网络收字节, 网络发字节)；虚拟机未运行时为 None。
+
+    libvirt 9 对已关机的虚拟机也会给出上次运行留下的 cpu.time / block 计数，必须按状态判断。"""
+    cpu = _stat_int(st, "cpu.time")
+    if cpu is None or domstats_state(st) not in VM_LIVE_STATES:
+        return None
+    rd = wr = rx = tx = 0
+    for i in range(_stat_int(st, "block.count") or 0):
+        rd += _stat_int(st, "block.%d.rd.bytes" % i) or 0
+        wr += _stat_int(st, "block.%d.wr.bytes" % i) or 0
+    for i in range(_stat_int(st, "net.count") or 0):
+        rx += _stat_int(st, "net.%d.rx.bytes" % i) or 0
+        tx += _stat_int(st, "net.%d.tx.bytes" % i) or 0
+    return (cpu, rd, wr, rx, tx)
+
+
+def _xml_mem_bytes(el):
+    if el is None:
+        return None
+    try:
+        return int(int((el.text or "").strip()) * _XML_MEM_UNITS.get((el.get("unit") or "KiB").lower(), 1024))
+    except Exception:
+        return None
+
+
+def parse_domain_xml(xml_text):
+    """从 `virsh dumpxml` 提取展示信息：标识、规格、固件、磁盘、网卡、图形控制台、guest agent。"""
+    info = {"uuid": "", "title": "", "description": "", "vcpus": None, "mem_max": None, "arch": "",
+            "machine": "", "firmware": "", "disks": [], "nics": [], "graphics": [],
+            "agent": False, "agent_connected": False, "os": "", "fn_autostart": None}
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return info
+    txt = lambda p: (root.findtext(p) or "").strip()
+    info["uuid"] = txt("uuid").lower()
+    info["title"] = txt("title")[:120]
+    info["description"] = txt("description")[:500]
+    # 飞牛虚拟机把系统类型 / 版本 / 开机自启写在 <metadata><customMeta> 里（各元素带自定义命名空间），
+    # 开机自启由飞牛自己管理，libvirt 的 autostart 恒为关闭
+    meta = {}
+    for el in root.iterfind("metadata//*"):
+        meta.setdefault(el.tag.rsplit("}", 1)[-1], (el.text or "").strip())
+    info["os"] = " ".join(x for x in ({"linux": "Linux", "windows": "Windows", "other": "其他"}.get(
+        meta.get("osType", "").lower(), meta.get("osType", "")), meta.get("osVersion", "")) if x)[:80]
+    if meta.get("autostart", "").lower() in ("true", "false"):
+        info["fn_autostart"] = meta["autostart"].lower() == "true"
+    vcpu = root.find("vcpu")
+    if vcpu is not None:
+        try:
+            info["vcpus"] = int(vcpu.get("current") or (vcpu.text or "").strip())
+        except Exception:
+            pass
+    info["mem_max"] = _xml_mem_bytes(root.find("memory"))
+    os_el = root.find("os")
+    if os_el is not None:
+        t = os_el.find("type")
+        if t is not None:
+            info["arch"] = t.get("arch") or ""
+            info["machine"] = t.get("machine") or ""
+        loader = os_el.find("loader")
+        fw = (os_el.get("firmware") or "").lower()
+        info["firmware"] = "UEFI" if fw == "efi" or (loader is not None and loader.get("type") == "pflash") else "BIOS"
+    for d in root.findall("devices/disk"):
+        tgt, src = d.find("target"), d.find("source")
+        path = ""
+        if src is not None:
+            path = src.get("file") or src.get("dev") or src.get("name") or src.get("volume") or ""
+        info["disks"].append({
+            "dev": tgt.get("dev") if tgt is not None else "",
+            "bus": tgt.get("bus") if tgt is not None else "",
+            "device": d.get("device") or "disk",
+            "path": path,
+            "readonly": d.find("readonly") is not None,
+            "capacity": None, "allocation": None,
+        })
+    for n in root.findall("devices/interface"):
+        mac, src, model, tgt = n.find("mac"), n.find("source"), n.find("model"), n.find("target")
+        source = ""
+        if src is not None:
+            source = src.get("bridge") or src.get("network") or src.get("dev") or ""
+        info["nics"].append({
+            "mac": (mac.get("address") or "").lower() if mac is not None else "",
+            "type": n.get("type") or "",
+            "source": source,
+            "model": model.get("type") if model is not None else "",
+            "target": tgt.get("dev") if tgt is not None else "",
+            "ips": [],
+        })
+    for g in root.findall("devices/graphics"):
+        listen = g.get("listen") or ""
+        le = g.find("listen")
+        if not listen and le is not None:
+            listen = le.get("address") or ""
+        try:
+            port = int(g.get("port") or -1)
+        except Exception:
+            port = -1
+        # 飞牛的 VNC 走本机 unix 套接字（socket 属性），没有 TCP 端口
+        info["graphics"].append({"type": g.get("type") or "", "port": port if port > 0 else None, "listen": listen,
+                                 "socket": g.get("socket") or ""})
+    for ch in root.findall("devices/channel"):
+        t = ch.find("target")
+        if t is not None and t.get("name") == "org.qemu.guest_agent.0":
+            info["agent"] = True
+            info["agent_connected"] = t.get("state") == "connected"
+    return info
+
+
+def parse_domifaddr(text):
+    """解析 `virsh domifaddr` 输出 → {MAC: [IP]}，去掉回环与 IPv6 链路本地地址。"""
+    res, mac = {}, None
+    for line in (text or "").splitlines():
+        p = line.split()
+        if len(p) < 4 or p[2] not in ("ipv4", "ipv6"):
+            continue
+        if _MAC_RE.match(p[1]):
+            mac = p[1].lower()
+        if not mac:
+            continue
+        ip = p[3].split("/")[0]
+        if ip.startswith("127.") or ip == "::1" or ip.lower().startswith("fe80:"):
+            continue
+        lst = res.setdefault(mac, [])
+        if ip not in lst:
+            lst.append(ip)
+    return res
+
+
+def parse_domblkinfo(text):
+    """`virsh domblkinfo` → (容量字节, 宿主实际占用字节)。实际占用取 Physical（镜像文件大小），没有再用 Allocation。"""
+    vals = {}
+    for line in (text or "").splitlines():
+        k, _, v = line.partition(":")
+        try:
+            vals[k.strip().lower()] = int(v.strip())
+        except Exception:
+            pass
+    phys = vals.get("physical")
+    return vals.get("capacity"), phys if phys is not None else vals.get("allocation")
+
+
+def arp_table():
+    """/proc/net/arp：MAC → [IPv4]（只取已完成解析的条目）。桥接到宿主网卡的虚拟机靠它找 IP。"""
+    res = {}
+    for line in read_text("/proc/net/arp").splitlines()[1:]:
+        p = line.split()
+        if len(p) >= 4 and p[2] != "0x0" and p[3] != "00:00:00:00:00:00":
+            res.setdefault(p[3].lower(), []).append(p[0])
+    return res
+
+
+def qemu_proc_info(name):
+    """虚拟机 QEMU 进程的 (已运行秒数, 常驻内存字节)；读不到时对应项为 None。"""
+    pid_s = read_text("/run/libvirt/qemu/%s.pid" % name).strip() if "/" not in name else ""
+    if not pid_s.isdigit():
+        return None, None
+    pid = int(pid_s)
+    up = rss = None
+    try:
+        stat = read_text("/proc/%d/stat" % pid)
+        fields = stat[stat.rindex(")") + 2:].split()      # fields[0] 为第 3 列 state，第 22 列 starttime 即 [19]
+        btime = next(int(l.split()[1]) for l in read_text("/proc/stat").splitlines() if l.startswith("btime "))
+        up = max(0, int(time.time() - (btime + int(fields[19]) / os.sysconf("SC_CLK_TCK"))))
+    except Exception:
+        pass
+    m = re.search(r"^VmRSS:\s+(\d+)\s*kB", read_text("/proc/%d/status" % pid), re.M)
+    if m:
+        rss = int(m.group(1)) * 1024
+    return up, rss
+
+
+class VmMonitor:
+    """虚拟机采集：`virsh domstats` 一次拿到全部虚拟机的累计计数，与上次采样差分得到实时速率。
+
+    按需采集（只有打开虚拟机页 / 详情时前端才轮询），4 秒内多客户端复用结果，不进后台采集循环；
+    运行中的虚拟机没有新鲜的上次采样时间隔 1 秒连采两次，打开页面即有读数。
+    dumpxml（磁盘 / 网卡 / 控制台）按虚拟机缓存 60 秒，状态变化时立即刷新。"""
+    CACHE_TTL = 4
+    PREV_MAX_AGE = 90
+    XML_TTL = 60
+    AUX_TTL = 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = None
+        self._cache_ts = 0.0
+        self._prev = {}        # 域名 → (ts, cpu_ns, rd, wr, rx, tx)
+        self._xml = {}         # 域名 → (ts, state, info)
+        self._ips = {}         # 域名 → (ts, {mac: [ip]})：guest agent / DHCP 租约查询结果
+        self._auto = (0.0, set())
+
+    def invalidate(self):
+        """虚拟机操作后调用：丢弃缓存，下次请求重新读取。"""
+        with self._lock:
+            self._cache = None
+            self._xml = {}
+            self._auto = (0.0, set())
+
+    def collect(self):
+        with self._lock:
+            if self._cache is not None and time.time() - self._cache_ts < self.CACHE_TTL:
+                return self._cache
+            data = self._collect()
+            self._cache, self._cache_ts = data, time.time()
+            return data
+
+    @staticmethod
+    def _sample():
+        out, err, rc = run_virsh(["domstats", "--raw"], timeout=20)
+        return (parse_domstats(out) if rc == 0 else None), err, time.time()
+
+    def _collect(self):
+        res = {"available": False, "installed": bool(virsh_path()), "kvm": os.path.exists("/dev/kvm"),
+               "error": "", "vms": [], "sampled_at": time.time()}
+        if not res["installed"]:
+            res["error"] = "未检测到 virsh：本机可能没有启用飞牛虚拟机功能"
+            return res
+        doms, err, ts = self._sample()
+        if doms is None:
+            res["error"] = virsh_error_text(err) or "无法连接 libvirt（虚拟机服务未运行？）"
+            return res
+        stale = [name for name, st in doms if domstats_counters(st) is not None
+                 and ts - self._prev.get(name, (0.0,))[0] > self.PREV_MAX_AGE]
+        if stale:
+            self._prev = {name: (ts,) + c for name, c in ((n, domstats_counters(s)) for n, s in doms) if c}
+            time.sleep(1.0)
+            d2, _, ts2 = self._sample()
+            if d2 is not None:
+                doms, ts = d2, ts2
+        res["available"] = True
+        auto, arp, nxt = self._autostart(), arp_table(), {}
+        vms = [self._build(name, st, ts, auto, arp, nxt) for name, st in doms]
+        self._prev = nxt
+        names = {name for name, _ in doms}
+        self._xml = {k: v for k, v in self._xml.items() if k in names}
+        self._ips = {k: v for k, v in self._ips.items() if k in names}
+        vms.sort(key=lambda v: (VM_STATE_ORDER.get(v["state"], 9), (v["title"] or v["name"]).lower()))
+        res["vms"] = vms
+        res["sampled_at"] = ts
+        return res
+
+    def _autostart(self):
+        ts, names = self._auto
+        if time.time() - ts < self.AUX_TTL:
+            return names
+        out, _, rc = run_virsh(["list", "--all", "--autostart", "--name"], timeout=10)
+        names = {x.strip() for x in out.splitlines() if x.strip()} if rc == 0 else set()
+        self._auto = (time.time(), names)
+        return names
+
+    def _xml_info(self, name, state, need_blk):
+        ent = self._xml.get(name)
+        if ent and ent[1] == state and time.time() - ent[0] < self.XML_TTL:
+            return ent[2]
+        out, _, rc = run_virsh(["dumpxml", "--domain", name], timeout=10)
+        info = parse_domain_xml(out) if rc == 0 else parse_domain_xml("")
+        # 较老的 libvirt 对未运行的虚拟机不给 block 统计：逐块 domblkinfo 读镜像（随 XML 一起缓存）
+        if need_blk and state not in VM_LIVE_STATES:
+            for d in info["disks"]:
+                if d["device"] == "disk" and d["dev"]:
+                    bo, _, brc = run_virsh(["domblkinfo", "--domain", name, "--device", d["dev"]], timeout=10)
+                    if brc == 0:
+                        d["capacity"], d["allocation"] = parse_domblkinfo(bo)
+        self._xml[name] = (time.time(), state, info)
+        return info
+
+    def _guest_ips(self, name, info):
+        """ARP 查不到时的补充：guest agent 已连接 → 问虚拟机自己；libvirt NAT 网络 → 查 DHCP 租约。"""
+        ent = self._ips.get(name)
+        if ent and time.time() - ent[0] < self.AUX_TTL:
+            return ent[1]
+        found = {}
+        sources = (["agent"] if info["agent_connected"] else []) + \
+                  (["lease"] if any(n["type"] == "network" for n in info["nics"]) else [])
+        for src in sources:
+            out, _, rc = run_virsh(["domifaddr", "--domain", name, "--source", src], timeout=6)
+            if rc == 0:
+                for mac, ips in parse_domifaddr(out).items():
+                    lst = found.setdefault(mac, [])
+                    lst += [ip for ip in ips if ip not in lst]
+        self._ips[name] = (time.time(), found)
+        return found
+
+    def _build(self, name, st, ts, auto, arp, nxt):
+        state = domstats_state(st)
+        running = state in VM_LIVE_STATES
+        # domstats 的 block.N.name 对应 XML 的 target dev；libvirt 9 对已关机的虚拟机也会给容量。
+        # 宿主实际占用取 physical（镜像文件大小）：运行中 qcow2 的 allocation 是本次开机写到的最高偏移，常为 0
+        blk = {}
+        for i in range(_stat_int(st, "block.count") or 0):
+            cap = _stat_int(st, "block.%d.capacity" % i)
+            if cap is not None:
+                phys = _stat_int(st, "block.%d.physical" % i)
+                blk[st.get("block.%d.name" % i, "")] = (cap, phys if phys is not None else _stat_int(st, "block.%d.allocation" % i))
+        info = self._xml_info(name, state, need_blk=not blk)
+        vm = {
+            "uuid": info["uuid"], "name": name, "title": info["title"], "description": info["description"],
+            "state": state, "state_zh": VM_STATE_ZH.get(state, state), "running": running,
+            "autostart": name in auto or bool(info["fn_autostart"]), "os": info["os"],
+            "vcpus": _stat_int(st, "vcpu.current") or info["vcpus"],
+            "mem": None, "mem_max": info["mem_max"], "mem_rss": None, "mem_guest_used": None,
+            "cpu": None, "cpu_cores": None, "rd_rate": None, "wr_rate": None, "rx_rate": None, "tx_rate": None,
+            "rd_bytes": None, "wr_bytes": None, "rx_bytes": None, "tx_bytes": None, "uptime": None,
+            "arch": info["arch"], "machine": info["machine"], "firmware": info["firmware"],
+            "agent": info["agent"], "agent_connected": info["agent_connected"],
+            "disks": [dict(d) for d in info["disks"]], "nics": [dict(n, ips=[]) for n in info["nics"]],
+            "graphics": info["graphics"] if running else [], "ips": [],
+        }
+        for d in vm["disks"]:
+            if d["dev"] in blk:
+                d["capacity"], d["allocation"] = blk[d["dev"]]
+        if not running:
+            return vm
+        kib = lambda k: (_stat_int(st, k) * 1024) if _stat_int(st, k) is not None else None
+        vm["mem"] = kib("balloon.current") or info["mem_max"]
+        vm["mem_max"] = kib("balloon.maximum") or info["mem_max"]
+        avail, usable, unused = kib("balloon.available"), kib("balloon.usable"), kib("balloon.unused")
+        if avail and (usable is not None or unused is not None):
+            vm["mem_guest_used"] = max(0, avail - (usable if usable is not None else unused))
+        up, rss = qemu_proc_info(name)
+        vm["uptime"], vm["mem_rss"] = up, kib("balloon.rss") or rss
+        # IP：先查宿主 ARP 表，查不到再问 guest agent / DHCP 租约
+        for n in vm["nics"]:
+            n["ips"] = list(arp.get(n["mac"], []))
+        if any(n["mac"] and not n["ips"] for n in vm["nics"]):
+            extra = self._guest_ips(name, info)
+            for n in vm["nics"]:
+                n["ips"] += [ip for ip in extra.get(n["mac"], []) if ip not in n["ips"]]
+        vm["ips"] = [ip for n in vm["nics"] for ip in n["ips"]]
+        # 实时速率：与上次采样的累计计数差分；计数回退（虚拟机重启）时本轮不给速率
+        cur = domstats_counters(st)
+        if cur is None:
+            return vm
+        vm["rd_bytes"], vm["wr_bytes"], vm["rx_bytes"], vm["tx_bytes"] = cur[1:]
+        nxt[name] = (ts,) + cur
+        p = self._prev.get(name)
+        if p and 0.5 < ts - p[0] <= self.PREV_MAX_AGE and all(c >= q for c, q in zip(cur, p[1:])):
+            dt = ts - p[0]
+            cores = (cur[0] - p[1]) / dt / 1e9
+            vm["cpu_cores"] = round(cores, 3)
+            if vm["vcpus"]:
+                vm["cpu"] = round(min(100.0, cores / vm["vcpus"] * 100), 1)
+            vm["rd_rate"], vm["wr_rate"], vm["rx_rate"], vm["tx_rate"] = (
+                round((c - q) / dt, 1) for c, q in zip(cur[1:], p[2:]))
+            vm["rate_window"] = round(dt, 1)
+        return vm
+
+
+def vm_action(uuid, action):
+    """对虚拟机执行 start / shutdown（ACPI 关机）/ reboot / suspend / resume / destroy（强制断电）。"""
+    if action not in VM_ACTIONS:
+        return {"ok": False, "error": "不支持的操作: %s" % action}
+    # 只接受 UUID，避免命令注入与参数注入（UUID 不可能以 - 开头）
+    if not _VM_UUID_RE.match(uuid or ""):
+        return {"ok": False, "error": "非法的虚拟机标识"}
+    out, err, rc = run_virsh([action, "--domain", uuid], timeout=60)
+    if rc == 0:
+        return {"ok": True, "action": action, "uuid": uuid}
+    return {"ok": False, "action": action, "uuid": uuid,
+            "error": virsh_error_text(err) or (out or "").strip()[-300:] or "virsh 执行失败"}
+
+
+# ---------------------------------------------------------------------------
 # 飞牛内置应用统计（相册 / 影视 / 音乐）
 # ---------------------------------------------------------------------------
 BUILTIN_APPS = [
@@ -5638,6 +6084,7 @@ class MonitorApp:
         self._static_cache = {}
         self._export_sem = threading.BoundedSemaphore(2)   # 报告 / 导出并发上限
         self._apps_refresh_ts = 0.0
+        self.vms = VmMonitor()   # 虚拟机：按需采集（只在打开虚拟机页时轮询）
 
     def make_handler(self):
         app = self
@@ -5658,7 +6105,7 @@ class MonitorApp:
         CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
                "img-src 'self' data:; connect-src 'self'; frame-ancestors *")
         POST_ONLY = {"/api/auth/password", "/api/auth/setup", "/api/auth/logout", "/api/docker/action",
-                     "/api/config/save", "/api/update/install"}
+                     "/api/vm/action", "/api/config/save", "/api/update/install"}
 
         class Handler(BaseHTTPRequestHandler):
             # HTTP/1.1 长连接：浏览器复用 TCP 连接，避免每请求新建线程；timeout 保证空闲连接
@@ -5866,6 +6313,13 @@ class MonitorApp:
                     return
                 if path == "/api/docker":
                     self._json(app.api_docker())
+                    return
+                if path == "/api/vms":
+                    # probe=1：只判断本机是否有 virsh（前端据此决定是否显示「虚拟机」页），不调用 libvirt
+                    if (qs.get("probe") or ["0"])[0] in ("1", "true", "yes"):
+                        self._json({"installed": bool(virsh_path()), "kvm": os.path.exists("/dev/kvm")})
+                    else:
+                        self._json(app.vms.collect())
                     return
                 if path == "/api/modules":
                     self._json(app.api_modules())
@@ -6077,6 +6531,11 @@ class MonitorApp:
                     cid = str(data.get("id") or "").strip()
                     act = str(data.get("action") or "").strip()
                     self._json(app.api_docker_action(cid, act))
+                    return
+                if path == "/api/vm/action":
+                    uid = str(data.get("uuid") or "").strip()
+                    act = str(data.get("action") or "").strip()
+                    self._json(app.api_vm_action(uid, act))
                     return
                 if path == "/api/ui":
                     self._json(app.api_ui_set(data))
@@ -7301,6 +7760,14 @@ th{color:#64748b;font-weight:600;font-size:13px}.meta{color:#94a3b8;font-size:13
                 self.collector._last_docker_ts = time.time()
             except Exception:
                 pass
+        return result
+
+    def api_vm_action(self, uuid, action):
+        if not uuid:
+            return {"ok": False, "error": "缺少虚拟机 UUID"}
+        result = vm_action(uuid, action)
+        # 无论成败都丢弃缓存：前端随后轮询能立刻看到新状态
+        self.vms.invalidate()
         return result
 
     def iter_history_csv(self, range_):

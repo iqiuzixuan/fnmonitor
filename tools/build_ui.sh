@@ -23,7 +23,7 @@ trap 'rm -rf "$TMP"' EXIT
   # 注意顺序：44-toast 需在 40-hero 之前（与原构建一致）
   cat "$S/30-core.js" "$S/31-line.js" "$S/32-bars.js" "$S/33-state.js" "$S/44-toast.js" \
       "$S/40-hero.js" "$S/41-modules.js" "$S/42-modules.js" "$S/43-modules.js" \
-      "$S/45-sheets.js" "$S/46-docker.js" "$S/47-settings.js" "$S/48-layout.js" "$S/49-app.js" > "$TMP/all.js"
+      "$S/45-sheets.js" "$S/46-docker.js" "$S/46-vms.js" "$S/47-settings.js" "$S/48-layout.js" "$S/49-app.js" > "$TMP/all.js"
   python3 tools/minify_ui.py js "$TMP/all.js"; echo
   printf '})();\n</script>\n</body>\n</html>\n'
 } > "$TMP/index.html"

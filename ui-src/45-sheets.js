@@ -299,7 +299,7 @@ const SHEETS = {
   keys: {
     icon: () => 'key', title: () => '键盘快捷键', sub: () => '在任何页面都可使用',
     build(b) {
-      const k = [['1 / 2 / 3', '切换到 总览 / 容器 / 设置'], ['/', '搜索硬盘、容器、设置'], ['E', '编辑布局（隐藏、拖动排序）'], ['T', '切换浅色 / 深色'], ['R', '循环切换趋势时间范围'], ['F11', '全屏'], ['Esc', '关闭抽屉 / 搜索 / 退出编辑'], ['?', '显示本面板']];
+      const np = navPages(), k = [[np.map((p, i) => i + 1).join(' / '), '切换到 ' + np.map(p => PAGE_TITLE[p]).join(' / ')], ['/', '搜索硬盘、容器、虚拟机、设置'], ['E', '编辑布局（隐藏、拖动排序）'], ['T', '切换浅色 / 深色'], ['R', '循环切换趋势时间范围'], ['F11', '全屏'], ['Esc', '关闭抽屉 / 搜索 / 退出编辑'], ['?', '显示本面板']];
       b.innerHTML = `<div class="card"><div class="keys">${k.map(([a, d]) => `<span>${d}</span><span>${a.split(' / ').map(z => `<span class="kbd">${z}</span>`).join(' ')}</span>`).join('')}</div></div>`;
     },
   },

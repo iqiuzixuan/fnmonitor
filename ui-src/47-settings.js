@@ -168,7 +168,7 @@ const SET_SCHEMA = [
     uiItem('motion', '动效', 'toggle', { hint: '系统开启“减少动态效果”时始终关闭' }),
     { k: 'uiSync', label: '界面设置同步', type: 'action', button: '立即同步', hint: () => `外观、布局与阈值保存在 NAS：<span class="mono">${esc((S.cfg && S.cfg.ui_file) || '数据目录/ui.json')}</span>，换设备或清缓存后自动恢复`, run: async b => { b.disabled = true; const okk = await postUI(); b.disabled = false; toast(okk ? '已同步到 NAS' : '同步失败，请检查连接', okk ? {} : { icon: 'alert' }); } },
     { k: 'hiddenMods', label: '已隐藏的版块', type: 'info', html: hiddenHTML },
-    { k: 'resetLayout', label: '布局', type: 'action', button: '恢复默认布局', run: () => { resetLayout('overview'); resetLayout('docker'); toast('已恢复默认布局'); syncSettings(); } },
+    { k: 'resetLayout', label: '布局', type: 'action', button: '恢复默认布局', run: () => { Object.keys(LAYOUT_DEFAULT).forEach(resetLayout); toast('已恢复默认布局'); syncSettings(); } },
     { k: 'resetUI', label: '一键初始化界面', type: 'action', button: '恢复默认界面', danger: true, hint: '外观、主色、字号、布局与隐藏状态恢复默认（提醒阈值保持不变）', run: resetUI },
   ] },
   { id: 'auth', title: '登录口令', icon: 'lock', desc: '开启后，访问飞牛监控需要先输入口令。', custom: renderAuth },
@@ -186,7 +186,7 @@ document.addEventListener('click', e => {
   const v = b.dataset.restore;
   if (v === '*') Object.keys(UI.hidden).forEach(p => { UI.hidden[p] = []; });
   else { const [p, id] = v.split(':'); UI.hidden[p] = (UI.hidden[p] || []).filter(x => x !== id); }
-  applyLayout('overview'); applyLayout('docker'); saveUI(); syncSettings(); toast('已恢复显示');
+  Object.keys(LAYOUT_DEFAULT).forEach(applyLayout); saveUI(); syncSettings(); toast('已恢复显示');
 });
 
 function renderIgnored(card) {
