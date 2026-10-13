@@ -1,9 +1,23 @@
 /* =====================================================================
    HEALTH — 一句话结论 + 健康分（全部基于真实读数与「提醒阈值」）
    ===================================================================== */
+/* 忽略提醒：用户可手动忽略某个问题。记录 key（是哪个问题）+ fp（忽略时的状态指纹）。
+   指纹规则：数值类（CPU / 内存 / 容量 / 温度）只看级别，升级（留意 → 严重）才重新提醒；
+   SMART 看各计数（如重映射扇区 8 → 12 即重新提醒）；容器看是哪些容器未运行；阵列看状态文字。
+   问题暂时消失（已恢复或休眠读不到）不清除忽略记录，设置里可查看与取消。 */
+const Ignore = {
+  list: () => UI.ignored || [],
+  get: key => (UI.ignored || []).find(x => x.key === key),
+  add(it) {
+    UI.ignored = Ignore.list().filter(x => x.key !== it.key).concat([{ key: it.key, fp: it.fp, label: it.base || it.text, level: it.level, at: Date.now() }]).slice(-100);
+    saveUI(); renderNow(); syncSettings();
+    toast(`已忽略 · ${it.base || it.text}`, { sub: '状态变化时会重新提醒，可在 设置 → 已忽略的提醒 中取消', undo: () => Ignore.remove(it.key, true) });
+  },
+  remove(key, quiet) { UI.ignored = Ignore.list().filter(x => x.key !== key); saveUI(); renderNow(); syncSettings(); if (!quiet) toast('已恢复提醒', { key: 'save' }); },
+};
 function computeHealth(o) {
-  const issues = [], add = (level, key, text, sheet, go) => issues.push({ level, key, text, sheet, go });
-  if (!o) return { level: 'ok', issues, score: null };
+  const all = [], add = (level, key, text, sheet, go, fp) => all.push({ level, key, text, base: text, sheet, go, fp: fp == null ? level : String(fp) });
+  if (!o) return { level: 'ok', issues: [], ignored: [], score: null };
   const c = o.cpu && o.cpu.percent, lc = LV.cpu(c);
   // CPU 高占用需持续（≥3 次采样）才算问题，避免转码尖峰让结论闪烁
   if (lc && S.cpuHigh >= 3) add(lc, 'cpu', `CPU 占用${lc === 'crit' ? '过高' : '偏高'}（${F.int(c)}%）`, 'cpu');
@@ -14,21 +28,24 @@ function computeHealth(o) {
   if (lt) add(lt, 'temp', `CPU 温度${lt === 'crit' ? '过高' : '偏高'}（${F.int(t)}℃）`, 'temp');
   disksOf(o).forEach(d => {
     const sk = 'disk/' + d.name, sm = smartState(d);
-    if (sm.lv === 'crit' || sm.lv === 'warn') add(sm.lv, 'smart:' + d.name, `${d.name}：${sm.text}`, sk);
+    if (sm.lv === 'crit' || sm.lv === 'warn') add(sm.lv, 'smart:' + d.name, `${d.name}：${sm.text}`, sk, null, [sm.lv, String(d.health || '').toUpperCase()].concat(SMART_KEYS.map(([k]) => +d[k] || 0)).join(':'));
     if (!isSleep(d)) { const ld = LV.dtemp(d.temp); if (ld) add(ld, 'dt:' + d.name, `${d.name} 温度${ld === 'crit' ? '过高' : '偏高'}（${F.int(d.temp)}℃）`, sk); }
     if (+d.total > 0) { const lcap = LV.cap(d.percent); if (lcap && Math.abs((+d.percent) - (+o.disk_total)) > 0.5) add(lcap, 'cap:' + d.name, `${d.name} 已用 ${F.int(d.percent)}%`, sk); }
   });
-  (o.raid || []).forEach(r => { if ((r.members || []).some(x => /\(F\)/.test(x))) add('crit', 'raid:' + r.device, `阵列 ${r.device} 有成员盘故障`, 'storage'); });
+  (o.raid || []).forEach(r => { const bad = (r.members || []).filter(x => /\(F\)/.test(x)); if (bad.length) add('crit', 'raid:' + r.device, `阵列 ${r.device} 有成员盘故障`, 'storage', null, 'crit:' + bad.slice().sort().join('|')); });
   const rc = o.raidcard || {};
   (rc.controllers || []).forEach(ct => {
-    (ct.vd || []).forEach(v => { if (v.badge === 'off') add('crit', 'vd:' + v.vd, `阵列卡 VD${v.vd} ${v.state_label || v.state}`, 'storage'); });
-    (ct.pds || []).forEach(p => { if (p.health && p.health !== 'ok') add(p.health === 'warn' ? 'warn' : 'crit', 'pd:' + p.loc, `阵列卡盘位 ${p.loc}：${p.health_label || p.health}`, 'storage'); });
+    (ct.vd || []).forEach(v => { if (v.badge === 'off') add('crit', 'vd:' + v.vd, `阵列卡 VD${v.vd} ${v.state_label || v.state}`, 'storage', null, 'crit:' + (v.state || '')); });
+    (ct.pds || []).forEach(p => { if (p.health && p.health !== 'ok') add(p.health === 'warn' ? 'warn' : 'crit', 'pd:' + p.loc, `阵列卡盘位 ${p.loc}：${p.health_label || p.health}`, 'storage', null, (p.health || '') + ':' + (p.health_label || '')); });
   });
   const dk = S.docker || o.docker;
-  if (dockerOk(dk)) { const stopped = (dk.containers || []).filter(x => !ctrRun(x)); if (stopped.length) add('info', 'docker', `${stopped.length} 个容器未运行`, null, 'docker'); }
+  if (dockerOk(dk)) { const stopped = (dk.containers || []).filter(x => !ctrRun(x)); if (stopped.length) add('info', 'docker', `${stopped.length} 个容器未运行`, null, 'docker', stopped.map(x => x.name).sort().join('|')); }
+  // 忽略分流：指纹一致 → 已忽略（不计入结论与健康分）；指纹变化 → 重新提醒并标注
+  const issues = [], ignored = [];
+  all.forEach(it => { const ig = Ignore.get(it.key); if (ig && ig.fp === it.fp) ignored.push(it); else { if (ig) { it.changed = true; it.text += ' · 较忽略时有变化'; } issues.push(it); } });
   const level = issues.some(i => i.level === 'crit') ? 'crit' : issues.some(i => i.level === 'warn') ? 'warn' : 'ok';
   const score = clamp(100 - issues.reduce((a, i) => a + (i.level === 'crit' ? 22 : i.level === 'warn' ? 7 : 1), 0), 0, 100);
-  return { level, issues, score };
+  return { level, issues, ignored, score };
 }
 
 /* 天气图标：按 WMO 天气代码选择（离线内联 SVG） */
@@ -88,6 +105,7 @@ const Hero = {
       else if (it.go === 'docker') { Docker.setFilter('exited'); go('docker'); }
       else if (it.go === 'retry') Poll.run('overview');
     });
+    this.r.issues.addEventListener('click', e => { if (e.target.closest('[data-ignored]')) openSheet('health'); });
     this.r.wx.addEventListener('click', e => { if (e.target.closest('[data-goset]')) focusSetting('weatherCity'); });
     this.clock(); setInterval(() => this.clock(), 1000);
   },
@@ -137,11 +155,11 @@ const Hero = {
     const sy = o.system || {}, host = esc(sy.hostname || 'NAS'), up = +o.uptime || 0;
     const att = h.issues.filter(i => i.level !== 'info');
     let v;
-    if (h.level === 'ok') v = `${host} 运行良好<span class="soft">${up >= 86400 ? `已连续运行 ${Math.floor(up / 86400)} 天` : `已运行 ${esc(F.dur(up))}`}，各项指标都在阈值以内。</span>`;
+    if (h.level === 'ok') v = `${host} 运行良好<span class="soft">${up >= 86400 ? `已连续运行 ${Math.floor(up / 86400)} 天` : `已运行 ${esc(F.dur(up))}`}，${h.ignored.length ? `除已忽略的 ${h.ignored.length} 项外，` : ''}各项指标都在阈值以内。</span>`;
     else if (h.level === 'warn') v = `${host} 运行平稳<span class="soft">有 ${att.length} 项需要留意：${esc(att[0].text)}${att.length > 1 ? ' 等' : ''}。</span>`;
     else v = `${host} 需要你的关注<span class="soft">${esc(att.filter(i => i.level === 'crit')[0].text)}${att.length > 1 ? `，另有 ${att.length - 1} 项` : ''}。</span>`;
     setHTML(r.verdict, v);
-    setHTML(r.issues, h.issues.slice(0, 6).map((it, i) => `<button class="pill btn ${it.level === 'info' ? '' : it.level}" type="button" data-i="${i}">${ic(it.level === 'info' ? 'info' : 'alert')}${esc(it.text)}${ic('chev')}</button>`).join('') + (h.issues.length > 6 ? `<button class="pill btn" type="button" data-sheet="health">另有 ${h.issues.length - 6} 项${ic('chev')}</button>` : ''));
+    setHTML(r.issues, h.issues.slice(0, 6).map((it, i) => `<button class="pill btn ${it.level === 'info' ? '' : it.level}" type="button" data-i="${i}">${ic(it.level === 'info' ? 'info' : 'alert')}${esc(it.text)}${ic('chev')}</button>`).join('') + (h.issues.length > 6 ? `<button class="pill btn" type="button" data-sheet="health">另有 ${h.issues.length - 6} 项${ic('chev')}</button>` : '') + (h.ignored.length ? `<button class="pill btn ghost" type="button" data-ignored="1" title="已忽略的提醒不计入健康分">${ic('eye-off')}已忽略 ${h.ignored.length} 项</button>` : ''));
     setText(r.uptime, F.dur(up));
     setText(r.os, String(sy.os_pretty || '--').replace(/ \(.*\)/, ''));
     const ip = (sy.ips || []).find(x => (x.ipv4 || []).length); setText(r.ip, ip ? ip.ipv4[0] : '--');

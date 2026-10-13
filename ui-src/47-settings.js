@@ -134,7 +134,7 @@ const SET_SCHEMA = [
   { id: 'service', title: '服务', icon: 'server', desc: '飞牛监控自身的运行方式。', items: [
     Object.assign(cfgItem('port', '服务端口', 'number', { min: 1024, max: 65535, strict: true, hint: () => '1024 – 65535；修改后需在 应用中心 → 飞牛监控 中重启应用生效，并在飞牛防火墙放行新端口' + (S.cfg && +S.cfg.port && S.cfg.listen_port && +S.cfg.listen_port !== +S.cfg.port ? `；当前实际监听 ${esc(S.cfg.listen_port)}（重启后切换）` : '') }), { get: () => S.cfg ? (+S.cfg.port || +S.cfg.listen_port || +location.port || 8777) : undefined }),
     cfgItem('open_mode', '飞牛桌面打开方式', 'seg', { options: [['url', '独立网页'], ['iframe', '飞牛窗口']], help: '点击飞牛桌面「飞牛监控」图标时的打开方式。独立网页：直接在浏览器新标签页打开（完整浏览器能力：全屏 / 下载 / 插件）。飞牛窗口：在 fnOS 桌面内嵌窗口中打开。保存时自动写入桌面入口——刷新飞牛桌面页面（F5）或重新登录后生效；若桌面尚未刷新仍弹出内嵌窗口，窗口内会显示引导页可一键转到浏览器。', hint: () => inIframe ? '当前在飞牛窗口内 · <a href="/" target="_blank" rel="noopener">立即在新标签页打开 ↗</a>' : '' }),
-    { k: 'weatherAuto', label: '天气自动定位', type: 'toggle', hint: '按 NAS 公网 IP 估算城市；需要外网', get: () => !(S.cfg && S.cfg.weather_city), set: (v, row) => { if (v) saveCfg({ weather_city: '' }, '已切换为自动定位天气', row).then(() => setTimeout(() => Poll.run('weather'), 800)); else { S.weatherManual = true; syncSettings(); setTimeout(() => { const i = $('.set-row[data-k="weather_city"] input'); i && i.focus(); }, 60); } } },
+    { k: 'weatherAuto', label: '天气自动定位', type: 'toggle', hint: '按 NAS 公网 IP 估算城市；需要外网', get: () => !(S.cfg && S.cfg.weather_city) && !S.weatherManual, set: (v, row) => { if (v) { S.weatherManual = false; saveCfg({ weather_city: '' }, '已切换为自动定位天气', row).then(() => { syncSettings(); setTimeout(() => Poll.run('weather'), 800); }); } else { S.weatherManual = true; syncSettings(); setTimeout(() => { const i = $('.set-row[data-k="weather_city"] input'); i && i.focus(); }, 60); } } },
     cfgItem('weather_city', '天气位置', 'text', { placeholder: '城市名（如 徐州）或 纬度,经度', showIf: () => !!(S.cfg && S.cfg.weather_city) || !!S.weatherManual, hint: '填城市名，或 纬度,经度（如 34.26,117.18）',
       validate: v => !v ? '请输入城市名或坐标；如需自动定位，请打开上方开关' : v.includes(',') && !/^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(v) ? '坐标格式应为 纬度,经度（如 34.26,117.18）' : v.length > 100 ? '位置太长了' : '',
       set: (v, row) => saveCfg({ weather_city: v }, '天气位置', row).then(() => setTimeout(() => Poll.run('weather'), 800)) }),
@@ -158,6 +158,7 @@ const SET_SCHEMA = [
     cfgToggle('disk_standby_protect', '休眠硬盘保护', { hint: '不唤醒已停转的硬盘', help: '开启后跳过休眠硬盘的容量 / SMART / 温度读取，避免把它唤醒；历史在硬盘醒来后补写。关闭则每个周期完整采集，硬盘可能无法进入休眠。' }),
     cfgToggle('ec_fan_probe', '实验性 · EC 风扇读取', { hint: '通过硬件 I/O 端口读取部分商用机（NEC / 联想）风扇转速，默认关闭', help: '仅在标准 hwmon / IPMI 读不到风扇时使用。该方式直接访问主板 EC 端口（只读），个别机型可能不兼容，如出现异常请关闭。' }),
   ] },
+  { id: 'ignored', title: '已忽略的提醒', icon: 'eye-off', desc: '在 健康检查 中忽略的问题会列在这里：不计入健康分与首页结论；问题状态发生变化（如重映射扇区数增加、级别从留意升为严重、未运行的容器变化）时会自动重新提醒。', custom: renderIgnored },
   { id: 'look', title: '外观', icon: 'palette', items: [
     uiItem('theme', '外观模式', 'seg', { options: [['light', '浅色'], ['dark', '深色'], ['auto', '跟随系统']] }),
     { k: 'colorspec', label: '色彩规范', type: 'colorspec', wide: true, hint: '概览安静、分析丰富：颜色按层级分工，紧急程度覆盖一切' },
@@ -188,6 +189,22 @@ document.addEventListener('click', e => {
   applyLayout('overview'); applyLayout('docker'); saveUI(); syncSettings(); toast('已恢复显示');
 });
 
+function renderIgnored(card) {
+  card.addEventListener('click', e => {
+    const un = e.target.closest('[data-unig]'); if (un) Ignore.remove(un.dataset.unig);
+    if (e.target.closest('[data-unall]')) { const n = Ignore.list().length; UI.ignored = []; saveUI(); renderNow(); syncSettings(); toast(`已恢复全部 ${n} 项提醒`, { key: 'save' }); }
+    if (e.target.closest('[data-openhealth]')) openSheet('health');
+  });
+  card._sync = () => {
+    const list = Ignore.list().slice().sort((a, b) => b.at - a.at);
+    if (!list.length) { setHTML(card, `<div class="set-row inline"><div><div class="lbl">暂无已忽略的提醒</div><div class="hint">在首页点击健康分或问题标签打开「健康检查」，可对单个问题选择忽略</div></div><div class="ctl"><button class="btn" type="button" data-openhealth="1">打开健康检查</button></div></div>`); return; }
+    const h = S.o ? computeHealth(S.o) : { issues: [], ignored: [] };
+    const state = ig => { if (h.ignored.some(i => i.key === ig.key)) return '<span class="ig-state on">仍存在 · 已静默</span>'; const cur = h.issues.find(i => i.key === ig.key); if (cur) return '<span class="ig-state on">有变化 · 已重新提醒</span>'; return '<span class="ig-state gone">当前未出现</span>'; };
+    setHTML(card, list.map(ig => `<div class="set-row ig-row"><span class="${ig.level === 'info' ? 'faint' : 'st-' + ig.level}">${ic(ig.level === 'info' ? 'info' : 'alert')}</span><div style="min-width:0"><div class="lbl">${esc(ig.label)}</div><div class="ig-meta">${state(ig)} · 忽略于 ${esc(ig.at ? F.mdhm(ig.at / 1000) : '--')}</div></div><div class="ctl"><button class="btn sm" type="button" data-unig="${esc(ig.key)}">${ic('eye')}取消忽略</button></div></div>`).join('')
+      + `<div class="set-row inline"><div><div class="lbl">全部恢复提醒</div><div class="hint">共 ${list.length} 项</div></div><div class="ctl"><button class="btn" type="button" data-unall="1">全部取消忽略</button></div></div>`);
+  };
+  card._sync();
+}
 function renderThresholds(card) {
   const ROWS = [['cpu', 'CPU 占用', '%'], ['mem', '内存占用', '%'], ['cap', '存储容量', '%'], ['temp', 'CPU 温度', '℃'], ['diskTemp', '硬盘温度', '℃']];
   card.innerHTML = ROWS.map(([k, l]) => `<div class="set-row th-row" data-k="${k}Warn"><div><div class="lbl">${l}</div><div class="hint" data-h="${k}"></div></div><div class="ctl th-pair" data-p="${k}"></div></div>`).join('') +

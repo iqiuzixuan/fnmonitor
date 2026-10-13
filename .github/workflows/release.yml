@@ -62,6 +62,15 @@ jobs:
           sh tools/build_ui.sh
           git diff --exit-code app/www/index.html || { echo "app/www/index.html 与 ui-src/ 不一致：请修改 ui-src 后执行 sh tools/build_ui.sh 再提交"; exit 1; }
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # 与 fnOS 自带 Python 一致
+
+      - name: 回归测试（失败则不发布）
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v
+
       - name: 构建 x86 / arm 安装包
         run: bash build.sh
 

@@ -2,7 +2,7 @@
    UI CONFIG SYNC — GET /api/ui 恢复，改动后防抖 POST；启动门禁防止默认值覆盖服务器配置
    ===================================================================== */
 let uiBootReady = false, uiPending = false, uiTimer = 0;
-const uiPayload = () => ({ theme: UI.theme, accent: UI.accent, dotMatrix: UI.dotMatrix, motion: UI.motion, fontScale: UI.fontScale, range: UI.range, layoutVersion: LAYOUT_VERSION, layout: UI.layout, hidden: UI.hidden, thresholds: TH });
+const uiPayload = () => ({ theme: UI.theme, accent: UI.accent, dotMatrix: UI.dotMatrix, motion: UI.motion, fontScale: UI.fontScale, range: UI.range, layoutVersion: LAYOUT_VERSION, layout: UI.layout, hidden: UI.hidden, thresholds: TH, ignored: UI.ignored || [] });
 function saveUI() {
   store.set('ui', uiPayload());
   clearTimeout(uiTimer);

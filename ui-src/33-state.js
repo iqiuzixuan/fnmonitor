@@ -24,8 +24,12 @@ const LAYOUT_DEFAULT = { overview: ['metrics', 'storage', 'trends', 'compute', '
 /** 旧版 7 套主题 → 新版 外观模式 + 主色 */
 const LEGACY_THEME = { dark: ['dark', 'black'], light: ['light', 'black'], blue: ['light', 'blue'], fresh: ['light', 'green'], green: ['light', 'green'], yellow: ['light', 'yellow'], cyan: ['light', 'cyan'] };
 function uiDefaults() {
-  return { theme: 'light', accent: 'black', dotMatrix: true, motion: true, fontScale: 1, range: '24h', layoutVersion: LAYOUT_VERSION, layout: { overview: [], docker: [] }, hidden: { overview: [], docker: [] }, thresholds: sanitizeTH({}) };
+  return { theme: 'light', accent: 'black', dotMatrix: true, motion: true, fontScale: 1, range: '24h', layoutVersion: LAYOUT_VERSION, layout: { overview: [], docker: [] }, hidden: { overview: [], docker: [] }, thresholds: sanitizeTH({}), ignored: [] };
 }
+/** 已忽略的健康提醒：[{key, fp, label, level, at}]；key 标识问题，fp 是状态指纹（变化即重新提醒） */
+const cleanIgnored = a => Array.isArray(a) ? a.filter(x => x && typeof x.key === 'string' && x.key.length <= 120 && typeof x.fp === 'string' && x.fp.length <= 400)
+  .map(x => ({ key: x.key, fp: x.fp, label: String(x.label || x.key).slice(0, 160), level: ['warn', 'crit', 'info'].includes(x.level) ? x.level : 'warn', at: +x.at || 0 }))
+  .filter((x, i, arr) => arr.findIndex(y => y.key === x.key) === i).slice(-100) : [];
 const cleanIds = (a, page) => Array.isArray(a) ? a.filter((id, i) => typeof id === 'string' && LAYOUT_DEFAULT[page].includes(id) && a.indexOf(id) === i) : [];
 /** 把任意来源（服务器 / 本地缓存 / 旧版）的界面配置规整为新格式 */
 function normalizeUI(raw, base) {
@@ -40,6 +44,7 @@ function normalizeUI(raw, base) {
   const fs = parseFloat(raw.fontScale); if (isFinite(fs) && fs >= 0.8 && fs <= 1.5) u.fontScale = fs;
   if (RANGE_SEC[raw.range] !== undefined) u.range = raw.range;
   if (raw.thresholds) u.thresholds = sanitizeTH(raw.thresholds);
+  if (raw.ignored) u.ignored = cleanIgnored(raw.ignored);
   // 旧版布局（panelOrder / hiddenPanels / hiddenMods）结构不同，直接忽略
   if (isNew) {
     if (raw.layout && typeof raw.layout === 'object') u.layout = { overview: cleanIds(raw.layout.overview, 'overview'), docker: cleanIds(raw.layout.docker, 'docker') };

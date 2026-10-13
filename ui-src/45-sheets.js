@@ -37,13 +37,24 @@ const SHEETS = {
     icon: 'shield', title: () => '健康检查', sub: () => '每次刷新自动复核 · 阈值可在设置中调整',
     build(b) {
       b.innerHTML = `<div class="sheet-hero"><div><div class="eyebrow">健康分</div><div class="dnum"><span class="dm" data-ref="v"></span><span class="unit">分</span></div></div><div data-ref="lvl"></div></div>
-        ${rowsCard('<div data-ref="list"></div>')}
-        <p class="sub">健康分从 100 起算：每项需要留意 −7，严重 −22，提示 −1。判定使用「设置 → 提醒阈值」，与健康报告口径一致。</p>
+        <div data-ref="probs" style="display:contents"></div>
+        ${sec('逐项检查')}${rowsCard('<div data-ref="list"></div>')}
+        <p class="sub">健康分从 100 起算：被忽略的提醒不计分；每项需要留意 −7，严重 −22，提示 −1。判定使用「设置 → 提醒阈值」，与健康报告口径一致。</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" type="button" data-dl="/api/report?format=html">${ic('download')}生成健康报告（HTML）</button><button class="btn ghost" type="button" data-goset="thresholds">${ic('alert')}调整提醒阈值</button></div>`;
       const x = collect(b);
-      b.addEventListener('click', e => { const t = e.target.closest('[data-dl]'); if (t) doDownload(t.dataset.dl); const g = e.target.closest('[data-goset]'); if (g) { closeSheet(); focusGroup(g.dataset.goset); } });
+      b.addEventListener('click', e => {
+        const t = e.target.closest('[data-dl]'); if (t) doDownload(t.dataset.dl);
+        const g = e.target.closest('[data-goset]'); if (g) { closeSheet(); focusGroup(g.dataset.goset); }
+        const ig = e.target.closest('[data-ig]'); if (ig) { e.stopPropagation(); const it = (b._issues || []).find(i => i.key === ig.dataset.ig); if (it) Ignore.add(it); }
+        const un = e.target.closest('[data-unig]'); if (un) { e.stopPropagation(); Ignore.remove(un.dataset.unig); }
+      });
       return o => {
-        const h = computeHealth(o); dnum(x.v, h.score);
+        const h = computeHealth(o); dnum(x.v, h.score); b._issues = h.issues;
+        const lvIc = lv => `<span class="${lv === 'info' ? 'faint' : 'st-' + lv}">${ic(lv === 'info' ? 'info' : 'alert')}</span>`;
+        let ph = '';
+        if (h.issues.length) ph += sec('需要处理', `<span class="faint">${h.issues.length} 项</span>`) + rowsCard(h.issues.map(it => `<div class="row-i ig-row ${it.sheet ? 'tap-row' : ''}" ${it.sheet ? `data-sheet="${esc(it.sheet)}"` : ''}>${lvIc(it.level)}<div style="min-width:0"><b style="font-weight:600">${esc(it.text)}</b>${it.changed ? '<div class="ig-meta">忽略后状态发生变化，已重新提醒</div>' : ''}</div><button class="btn sm ghost" type="button" data-ig="${esc(it.key)}" title="状态变化时会重新提醒">${ic('eye-off')}忽略</button></div>`).join(''));
+        if (h.ignored.length) ph += sec('已忽略', '<span class="faint">不计入健康分 · 状态变化时重新提醒</span>') + rowsCard(h.ignored.map(it => `<div class="row-i ig-row">${lvIc(it.level)}<div style="min-width:0"><b style="font-weight:600;color:var(--ink-2)">${esc(it.text)}</b></div><button class="btn sm" type="button" data-unig="${esc(it.key)}">${ic('eye')}恢复提醒</button></div>`).join(''));
+        setHTML(x.probs, ph);
         setHTML(x.lvl, `<span class="pill ${h.level}">${h.level === 'ok' ? '<span class="dot"></span>良好' : h.level === 'warn' ? ic('alert') + '需要留意' : ic('alert') + '严重'}</span>`);
         const row = (st, t, d, sheet) => `<div class="row-i ${sheet ? 'tap-row' : ''}" style="grid-template-columns:auto 1fr auto" ${sheet ? `data-sheet="${esc(sheet)}"` : ''}><span class="${st === true ? 'st-ok' : st === 'info' || st === 'none' ? 'faint' : 'st-' + st}">${ic(st === true ? 'check-c' : st === 'info' || st === 'none' ? 'info' : st === 'sleep' ? 'moon' : 'alert')}</span><div><b style="font-weight:600">${t}</b><div class="sub">${d}</div></div>${sheet ? ic('chev', 'i-sm faint') : ''}</div>`;
         const cpu = o.cpu || {}, mem = o.mem || {}, ct = cpuTemp(o);

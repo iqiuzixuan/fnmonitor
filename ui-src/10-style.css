@@ -627,8 +627,13 @@ a { color: var(--accent); text-decoration: none; }
 .set-row .ctl { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .set-row.block { grid-template-columns: 1fr; }
 .set-row.block .ctl { justify-content: flex-start; }
-.set-row.saved { animation: savedFlash 1.2s var(--ease); }
-@keyframes savedFlash { 0% { background: transparent; } 20% { box-shadow: inset 3px 0 0 var(--accent); } 100% { box-shadow: inset 0 0 0 transparent; } }
+.set-row.saved::before { animation: savedFlash 1.2s var(--ease); }
+/* 「已保存」反馈：整行柔和底色一闪后淡出（不再用贴边竖条，深色模式下竖条会显示为白色块） */
+@keyframes savedFlash { 0%, 100% { opacity: 0; } 18% { opacity: 1; } }
+.set-row { position: relative; }
+.set-row::before { content: ""; position: absolute; inset: 3px -10px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 7%, transparent); opacity: 0; pointer-events: none; z-index: 0; }
+[data-theme="dark"] .set-row::before { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.set-row > * { position: relative; z-index: 1; }
 .q { width: 18px; height: 18px; border-radius: 50%; display: inline-grid; place-items: center; color: var(--ink-3); transition: color var(--dur-1), background var(--dur-1); }
 .q:hover, .q[aria-expanded="true"] { color: var(--accent); background: var(--accent-soft); }
 .q .i { width: 14px; height: 14px; }
@@ -1005,8 +1010,7 @@ a { color: var(--ink-1); }
 .set-nav a.on { background: var(--accent); color: var(--on-accent); box-shadow: none; }
 .set-nav a.on .i { color: var(--on-accent); }
 .set-nav a:hover:not(.on) { background: var(--card); }
-.set-row.saved { animation: savedFlashD 1.2s var(--ease); }
-@keyframes savedFlashD { 0% { box-shadow: inset 0 0 0 transparent; } 20% { box-shadow: inset 3px 0 0 var(--ink-1); } 100% { box-shadow: inset 0 0 0 transparent; } }
+.set-row.saved::before { animation: savedFlash 1.2s var(--ease); }
 .field { background: var(--card); box-shadow: none; }
 .field:focus-within { box-shadow: inset 0 0 0 1.5px var(--ink-1); }
 

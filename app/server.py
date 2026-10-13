@@ -57,7 +57,7 @@ def _read_manifest_version():
             pass
     return ""
 
-VERSION = _read_manifest_version() or "2.18.1"   # manifest 不可读时回退（须与 manifest 同步）
+VERSION = _read_manifest_version() or "2.18.2"   # manifest 不可读时回退（须与 manifest 同步）
 UPDATE_REPO = "iqiuzixuan/fnmonitor"       # GitHub 仓库（fork）：在线检查更新 / 下载安装包
 UPDATE_CHECK_INTERVAL = 6 * 3600           # 自动更新检查周期（6 小时）
 # 下载加速：直连 GitHub 下载域在国内常不可达，失败后自动依次尝试公共加速镜像
@@ -313,6 +313,29 @@ class LoginLimiter:
     def success(self, ip):
         with self._lock:
             self._ips.pop(ip, None)
+
+
+def sanitize_ignored(raw):
+    """校验「已忽略的健康提醒」（v2.18.2）：[{key, fp, label, level, at}]，最多 100 条。
+    key 标识问题、fp 为忽略时的状态指纹（前端比较指纹变化即重新提醒）；只保留字符串 / 数字，限制长度。"""
+    out, seen = [], set()
+    if not isinstance(raw, list):
+        return out
+    for x in raw[-100:]:
+        if not isinstance(x, dict):
+            continue
+        key, fp = x.get("key"), x.get("fp")
+        if not isinstance(key, str) or not isinstance(fp, str) or not key or len(key) > 120 or len(fp) > 400 or key in seen:
+            continue
+        seen.add(key)
+        level = x.get("level") if x.get("level") in ("warn", "crit", "info") else "warn"
+        try:
+            at = int(float(x.get("at") or 0))
+        except Exception:
+            at = 0
+        label = "".join(ch for ch in str(x.get("label") or key) if ch >= " ")[:160]
+        out.append({"key": key, "fp": fp, "label": label, "level": level, "at": max(0, at)})
+    return out
 
 
 # 虚拟网卡前缀（Docker 网桥 / 容器 / VPN 等）：流量与功耗估算统一口径
@@ -5640,6 +5663,8 @@ class MonitorApp:
             # HTTP/1.1 长连接：浏览器复用 TCP 连接，避免每请求新建线程；timeout 保证空闲连接
             # 30 秒内回收（并发连接数另有上限）
             protocol_version = "HTTP/1.1"
+            # 长连接下必须关闭 Nagle：否则小响应要等对端延迟 ACK，每个请求白等约 40ms（浏览器轮询全走长连接）
+            disable_nagle_algorithm = True
             timeout = 30
             server_version = "fnMonitor"
             sys_version = ""
@@ -6594,6 +6619,8 @@ class MonitorApp:
                 clean[k] = data[k]
         if "thresholds" in data:
             clean["thresholds"] = sanitize_thresholds(data.get("thresholds"))
+        if "ignored" in data:
+            clean["ignored"] = sanitize_ignored(data.get("ignored"))
         # 主色只接受十六进制颜色或简单的主题色名（防止值被拼进 style / HTML 形成注入）
         if "accent" in clean and not re.match(r"^(#[0-9a-fA-F]{3,8}|[A-Za-z0-9_-]{1,32})$", str(clean["accent"])):
             clean.pop("accent", None)
