@@ -44,6 +44,38 @@ class ShellSyntaxTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
+@unittest.skipUnless(_which("bash"), "bash not available")
+class LifecycleLogTest(unittest.TestCase):
+    """应用中心周期性调用 `cmd/main status` 并把输出追加进应用日志：status 必须静默，
+    否则每次轮询都多一行（旧版本刷出成千上万行 "fnmonitor is running"）。"""
+
+    def setUp(self):
+        self.var = tempfile.mkdtemp(prefix="fnm-var-")
+        self.addCleanup(shutil.rmtree, self.var, True)
+        self.env = dict(os.environ, TRIM_PKGVAR=self.var, TRIM_APPDEST=os.path.join(REPO, "app"),
+                        TRIM_APPNAME="fnmonitor", TRIM_TEMP_LOGFILE=os.path.join(self.var, "tmp.log"))
+
+    def _main(self, *args):
+        return subprocess.run(["bash", os.path.join(REPO, "cmd", "main")] + list(args),
+                              capture_output=True, text=True, env=self.env, timeout=30)
+
+    def test_status_is_silent(self):
+        r = self._main("status")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (3, "", ""))
+        # 运行中：PID 文件指向一个命令行含 server.py 与数据目录的进程
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "server.py", self.var])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        with open(os.path.join(self.var, "server.pid"), "w") as f:
+            f.write(str(p.pid))
+        r = self._main("status")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    def test_stop_when_not_running_is_silent(self):
+        r = self._main("stop")
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+
 @unittest.skipUnless(_which("sh"), "sh not available")
 class FrontendBuildTest(unittest.TestCase):
     @classmethod
