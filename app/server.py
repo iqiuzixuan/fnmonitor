@@ -3238,7 +3238,8 @@ def _docker_uptime_zh(status):
 def collect_docker():
     result = {"available": False, "error": "", "containers": [], "images": 0}
     out, rc = run_cmd(["docker", "ps", "-a", "--format", "{{json .}}"], timeout=20)
-    if rc != 0 or not out.strip():
+    # 输出为空 = 已安装但还没有容器，不能当成不可用
+    if rc != 0:
         result["error"] = "docker 命令不可用或无权限（请确认应用以 root 运行）"
         return result
     result["available"] = True

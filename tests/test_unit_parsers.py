@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from fnm_support import IS_LINUX, load_server
 
@@ -195,6 +196,29 @@ def _docker_ok():
         return subprocess.run(["docker", "info"], capture_output=True, timeout=15).returncode == 0
     except Exception:
         return False
+
+
+class CollectDockerAvailabilityTest(unittest.TestCase):
+    """docker 已安装但没有任何容器时 `docker ps -a` 输出为空，不能报「不可用」。"""
+
+    def _run(self, ps_out, ps_rc):
+        def fake(cmd, timeout=10):
+            if cmd[:2] == ["docker", "ps"]:
+                return ps_out, ps_rc
+            return "", 0
+        with mock.patch.object(srv, "run_cmd", side_effect=fake):
+            return srv.collect_docker()
+
+    def test_no_containers_is_available(self):
+        r = self._run("", 0)
+        self.assertTrue(r["available"], r["error"])
+        self.assertEqual(r["containers"], [])
+        self.assertEqual(r["error"], "")
+
+    def test_command_failure_is_unavailable(self):
+        r = self._run("", 1)
+        self.assertFalse(r["available"])
+        self.assertTrue(r["error"])
 
 
 @unittest.skipUnless(_docker_ok(), "docker daemon not reachable")
