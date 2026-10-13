@@ -9,6 +9,35 @@ function dailyRows(daysMap, keys, firstTs) {
   const ds = lastDays(n);
   return { days: ds, rows: ds.map((d, i) => Object.assign({ dim: i !== ds.length - 1 }, ...keys.map(k => ({ [k]: (daysMap[k][dayKey(d)] || 0) })))) };
 }
+/** /api/daily：后端按本地自然日汇总（不受历史保留天数限制，今天含实时尾段）。
+    旧后端没有该接口时返回 null，各图回退为前端按历史积分 */
+const Daily = {
+  at: 0, data: null, p: null,
+  get(maxAge = 300000) {
+    if (Date.now() - this.at < maxAge) return Promise.resolve(this.data);
+    if (this.p) return this.p;
+    this.p = API.get('/api/daily?days=' + DAY_BARS).then(j => (j && Array.isArray(j.days) && j.days.length ? j : null)).catch(() => null)
+      .then(j => { this.data = j; this.at = Date.now(); this.p = null; return j; });
+    return this.p;
+  },
+};
+/** 每日汇总 → 柱图行：从第一天有数据起到今天；中间没数据的日子保留空位（null，不画柱） */
+function dailyFromApi(j, pick) {
+  const ds = j.days, first = ds.findIndex(d => d.has_data && pick(d));
+  if (first < 0) return null;
+  const list = ds.slice(first), days = list.map(d => { const [y, mo, da] = d.day.split('-').map(Number); return new Date(y, mo - 1, da); });
+  return { list, days, rows: list.map((d, i) => Object.assign({ dim: i !== list.length - 1 }, pick(d) || {})) };
+}
+const nul = (v, f) => v == null ? '无数据' : f(v);
+/** 平均功率（本月预计 / 全年估算共用）：优先每日汇总的覆盖时长加权均值，其次功率历史均值，再次当前功率 */
+function avgW(o) {
+  const ds = ((Daily.data || {}).days || []).filter(d => ok(d.kwh) && +d.power_h > 0);
+  const h = ds.reduce((a, d) => a + +d.power_h, 0);
+  if (h >= 1) return { w: ds.reduce((a, d) => a + +d.kwh, 0) * 1000 / h, basis: `近 ${ds.length} 天平均`, n: ds.length };
+  const hp = Hist.peek('power', 'all'), pts = (hp && hp.points) || [];
+  if (pts.length > 5) return { w: pts.reduce((a, p) => a + (+p[1] || 0), 0) / pts.length, basis: '功率历史平均' };
+  return pwrOk(o) ? { w: +o.power.total, basis: '当前功率' } : null;
+}
 const barOpts = (days, series, fmt, h) => ({
   height: h, series, fmt,
   title: i => days[i] ? (days[i].getMonth() + 1) + '/' + days[i].getDate() + (i === days.length - 1 ? ' · 今天' : '') : '',
@@ -26,9 +55,10 @@ function powerParts(p) {
 }
 const ppI = c => c === 'hatch' ? '<i class="hatch"></i>' : `<i style="background:${c}"></i>`;
 const SRC_TXT = { rapl: '硬件 RAPL', estimated: '模型估算' };
-/** 本月预计：已用电量 + 剩余时长 × 平均功率（取功率历史均值，无历史时用当前功率） */
-const avgPower = o => { const h = Hist.peek('power', 'all'), pts = (h && h.points) || []; if (pts.length > 5) return pts.reduce((a, p) => a + (+p[1] || 0), 0) / pts.length; return pwrOk(o) ? +o.power.total : null; };
-const monthProj = (mk, o) => { const w = avgPower(o); if (!ok(mk) || w == null) return null; const d = new Date(), end = new Date(d.getFullYear(), d.getMonth() + 1, 1); return { kwh: mk + w * (end - d) / 3.6e9, w }; };
+/** 本月预计：已用电量 + 剩余时长 × 平均功率 */
+const monthProj = (mk, o) => { const a = avgW(o); if (!ok(mk) || !a) return null; const d = new Date(), end = new Date(d.getFullYear(), d.getMonth() + 1, 1); return { kwh: mk + a.w * (end - d) / 3.6e9, w: a.w, basis: a.basis }; };
+/** 全年估算：平均功率 × 8760 小时（只是估算，口径写在副标题里） */
+const yearProj = o => { const a = avgW(o); return a ? { kwh: a.w * 8.76, w: a.w, basis: a.basis } : null; };
 defineModule({
   id: 'energy', page: 'overview', dc: 'pwr', kicker: 'ENERGY', title: '能耗', dek: '实时功耗、用电量与电费',
   actions: () => detailBtn('power'),
@@ -45,22 +75,35 @@ defineModule({
         <div class="stat-cell"><div class="eyebrow">今日用电</div><div class="dnum"><span class="dm" data-ref="tk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="tc"></div></div>
         <div class="stat-cell"><div class="eyebrow">本月用电</div><div class="dnum"><span class="dm" data-ref="mk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="mc"></div></div>
         <div class="stat-cell"><div class="eyebrow">本月预计电费</div><div class="dnum"><span class="dm" data-ref="pc"></span></div><div class="sub" data-ref="pk"></div></div>
-        <div class="stat-cell"><div class="eyebrow">开机以来</div><div class="dnum"><span class="dm" data-ref="bk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="bc"></div></div>
+        <div class="stat-cell"><div class="eyebrow">全年估算<span class="pill est-pill">估算</span></div><div class="dnum"><span class="dm" data-ref="yc"></span></div><div class="sub" data-ref="yk"></div></div>
       </div>
     </div>
     <div class="card chart-card" style="margin-top:16px">
-      <div class="chart-head"><div class="chart-title" data-ref="barT">每日用电</div><div class="chart-legend"><span><span class="lk"><i class="kb0" style="--k:var(--e-teal)"></i>每日 kWh · 按功率历史积分</span></span></div></div>
+      <div class="chart-head"><div class="chart-title" data-ref="barT">每日用电</div><div class="chart-legend"><span><span class="lk"><i class="kb0" style="--k:var(--e-teal)"></i><span data-ref="barL">每日 kWh · 按功率历史积分</span></span></span></div></div>
       <div data-ref="bars"></div><div class="chart-empty-s" data-ref="barE" hidden></div>
     </div>`;
     m.x = collect(body);
+    const SER = [{ key: 'kwh', label: '用电', color: 'var(--e-teal)' }], fmt = v => nul(v, x => F.kwh(x) + ' kWh');
+    const show = (days, rows, title, legend, extra) => {
+      if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, SER, fmt, 132));
+      Object.assign(m.bars.opt, barOpts(days, SER, fmt, 132));
+      if (extra) { const t0 = m.bars.opt.title; m.bars.opt.title = i => t0(i) + extra(i); }
+      const any = !!rows.length; m.x.barE.hidden = any; m.x.bars.hidden = !any;
+      setText(m.x.barT, any ? title(days.length) : '近 30 天用电'); setText(m.x.barL, legend);
+      if (any) m.bars.setData(rows);
+    };
     m.loadBars = async () => {
+      const j = await Daily.get(), r = j && dailyFromApi(j, d => ok(d.kwh) ? { kwh: +d.kwh } : null);
+      setText(m.x.barE, '暂无功率数据：采集满一段时间后这里会显示每天的用电量');
+      if (j) {
+        if (!r) return show([], [], () => '', '每日 kWh');
+        // 提示里带上电费与数据覆盖时长（不足一整天的柱子是「部分日」，不是用电少）
+        return show(r.days, r.rows, n => `近 ${n} 天用电`, '每日 kWh · 功率历史积分', i => { const d = r.list[i]; if (!d) return ''; const part = ok(d.power_h) && d.power_h < 23.5 ? ` · 数据 ${F.d1(d.power_h)} 小时` : ''; return (ok(d.cost) ? ' · ' + F.yuan(d.cost) : '') + part; });
+      }
+      // 旧后端：前端按功率历史积分（只覆盖历史保留天数）
       const d = await Hist.get('power', 'all', 600000).catch(() => null), pts = (d && d.points) || [];
       const map = { kwh: dailyIntegral(pts, 1 / 3.6e6) }, { days, rows } = dailyRows(map, ['kwh'], pts.length ? pts[0][0] : 0);
-      if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, [{ key: 'kwh', label: '用电', color: 'var(--e-teal)' }], v => F.kwh(v) + ' kWh', 132));
-      Object.assign(m.bars.opt, barOpts(days, m.bars.opt.series, m.bars.opt.fmt, 132));
-      const any = pts.length > 1; m.x.barE.hidden = any; m.x.bars.hidden = !any;
-      setText(m.x.barE, '暂无功率历史，无法统计每日用电'); setText(m.x.barT, `近 ${days.length} 天用电`);
-      if (any) m.bars.setData(rows);
+      show(pts.length > 1 ? days : [], pts.length > 1 ? rows : [], n => `近 ${n} 天用电`, '每日 kWh · 按功率历史积分');
     };
   },
   update(o, m) {
@@ -77,8 +120,10 @@ defineModule({
     dnum(x.tk, en ? en.today_kwh : null, F.kwh); setText(x.tc, co ? '电费 ' + F.yuan(co.today_yuan) : '--');
     dnum(x.mk, en ? en.month_kwh : null, F.kwh); setText(x.mc, co ? '电费 ' + F.yuan(co.month_yuan) : '--');
     const pj = en ? monthProj(en.month_kwh, o) : null, pk = pj ? pj.kwh : null;
-    if (x.pc) dot(x.pc).set(pk != null && ok(rate) ? F.yuan(pk * rate) : '--'); setText(x.pk, pk != null ? `约 ${F.kwh(pk)} kWh · 剩余天数按平均 ${F.d1(pj.w)} W` : '本月数据不足');
-    dnum(x.bk, en ? en.boot_kwh : null, F.kwh); setText(x.bc, en && ok(rate) ? `电费 ${F.yuan(en.boot_kwh * rate)} · 按当前功率估` : '--');
+    if (x.pc) dot(x.pc).set(pk != null && ok(rate) ? F.yuan(pk * rate) : '--'); setText(x.pk, pk != null ? `约 ${F.kwh(pk)} kWh · 剩余天数按${pj.basis} ${F.d1(pj.w)} W` : '本月数据不足');
+    const yp = has || Daily.data ? yearProj(o) : null;
+    if (x.yc) dot(x.yc).set(yp && ok(rate) ? F.yuan(yp.kwh * rate) : '--');
+    setText(x.yk, yp ? `约 ${F.int(yp.kwh)} kWh · ${yp.basis} ${F.d1(yp.w)} W × 8760 小时` : '暂无可用的功率数据');
     const sl = disksOf(o).filter(isSleep).length, dw = S.cfg && S.cfg.power_disk_typical_w;
     setHTML(m.r.dek, !has ? '功耗不可用。' : `此刻 <b>${F.d1(p.total)} W</b>${ok(rate) ? `，按电价 ${esc(rate)} 元/kWh` : ''}${pk != null && ok(rate) ? `，本月电费预计 <b>${F.yuan(pk * rate)}</b>` : ''}。${sl ? `${sl} 块硬盘休眠中${ok(dw) ? `，每块约省 ${esc(dw)} W` : ''}。` : ''}`);
     if (!m.barsAt || Date.now() - m.barsAt > 600000) { m.barsAt = Date.now(); m.loadBars(); }
@@ -119,15 +164,23 @@ defineModule({
       <div data-ref="bars"></div><div class="chart-empty-s" data-ref="barE" hidden></div>
     </div>`;
     m.x = collect(body);
+    const SER = [{ key: 'rx', label: '下行', color: 'var(--e-blue)' }, { key: 'tx', label: '上行', color: 'var(--e-coral)' }], fmt = v => nul(v, F.bytesStr);
+    const show = (days, rows, title) => {
+      m.daily = rows;
+      if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, SER, fmt, 140));
+      Object.assign(m.bars.opt, barOpts(days, SER, fmt, 140));
+      const any = !!rows.length; m.x.barE.hidden = any; m.x.bars.hidden = !any;
+      setText(m.x.barT, any ? title : '近 30 天流量');
+      if (any) m.bars.setData(rows);
+    };
     m.loadBars = async () => {
+      const j = await Daily.get(), r = j && dailyFromApi(j, d => ok(d.rx) ? { rx: +d.rx, tx: +d.tx || 0 } : null);
+      setText(m.x.barE, '暂无流量数据：采集满一段时间后这里会显示每天的上下行流量');
+      if (j) return r ? show(r.days, r.rows, `近 ${r.days.length} 天流量 · ${j.exclude_bridge ? '物理网口' : '全部网口（含 Docker 网桥）'}，按网口计数器`) : show([], [], '');
+      // 旧后端：前端按速率历史积分（只覆盖历史保留天数）
       const d = await Hist.get('net', 'all', 600000).catch(() => null), rx = (d && d.rx) || [], tx = (d && d.tx) || [];
       const map = { rx: dailyIntegral(rx, 1), tx: dailyIntegral(tx, 1) }, { days, rows } = dailyRows(map, ['rx', 'tx'], rx.length ? rx[0][0] : 0);
-      m.daily = rows;
-      if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, [{ key: 'rx', label: '下行', color: 'var(--e-blue)' }, { key: 'tx', label: '上行', color: 'var(--e-coral)' }], F.bytesStr, 140));
-      Object.assign(m.bars.opt, barOpts(days, m.bars.opt.series, F.bytesStr, 140));
-      const any = rx.length > 1; m.x.barE.hidden = any; m.x.bars.hidden = !any;
-      setText(m.x.barE, '暂无网络历史，无法统计每日流量'); setText(m.x.barT, `近 ${days.length} 天流量 · 物理网口，按速率历史积分`);
-      if (any) m.bars.setData(rows);
+      show(rx.length > 1 ? days : [], rx.length > 1 ? rows : [], `近 ${days.length} 天流量 · 物理网口，按速率历史积分`);
     };
   },
   update(o, m) {
@@ -157,7 +210,7 @@ defineModule({
     setHTML(x.rank, cs.length ? rankHTML(cs, 6) : emptyHTML(dockerOk(dk) ? '没有运行中的容器' : 'Docker 不可用', dockerOk(dk) ? '' : esc((dk && dk.error) || ''), 'box'));
     if (!m.barsAt || Date.now() - m.barsAt > 600000) { m.barsAt = Date.now(); m.loadBars(); }
     let dek = tt ? `今天下载 <b>${F.bytesStr(tt.today_rx)}</b>、上传 ${F.bytesStr(tt.today_tx)}` : '流量统计加载中';
-    const prev = (m.daily || []).slice(0, -1).filter(r => r.rx > 0);
+    const prev = (m.daily || []).slice(0, -1).filter(r => +r.rx > 0);
     if (tt && prev.length >= 2) { const avg = prev.reduce((a, r) => a + r.rx, 0) / prev.length, diff = avg ? (tt.today_rx - avg) / avg * 100 : 0; if (avg) dek += `，${diff >= 0 ? '高于' : '低于'} ${prev.length} 天日均 ${F.int(Math.abs(diff))}%`; }
     dek += '。';
     if (cs.length) { const total = cs.reduce((a, c) => a + (+c.total_bytes || 0), 0); if (total) dek += `${esc(cs[0].name)} 是累计流量最大的容器，占 ${F.int(cs[0].total_bytes / total * 100)}%。`; }

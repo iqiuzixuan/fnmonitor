@@ -114,6 +114,20 @@ function setCores(tiles, pc) {
   });
 }
 const GPU_TAG = { igpu: '核显', nvidia: 'NVIDIA', amd: 'AMD' };
+/* Intel 核显引擎（i915 PMU，原理同 intel_gpu_top）：后端只下发实际存在的引擎 */
+const GPU_ENG = [['render', '渲染'], ['video', '视频'], ['video_enhance', '视频增强'], ['blitter', '复制'], ['compute', '计算']];
+const GPU_DIAG = '/api/gpu?diag=1';
+const gpuIntel = g => g && g.vendor === '8086';
+const gpuEngs = g => GPU_ENG.filter(([k]) => g.engines && ok(g.engines[k]));
+/** 核显读数状态：pmu（引擎实测）/ rc6（活跃度估算）/ warm（首轮采样）/ none（读不到） */
+const gpuMode = g => !gpuIntel(g) ? 'drv' : g.warming ? 'warm' : g.util_source === 'pmu' && gpuEngs(g).length ? 'pmu' : g.util_source === 'rc6' && ok(g.util) ? 'rc6' : 'none';
+const diagLink = () => `<a class="link-btn diag-link" href="${GPU_DIAG}" target="_blank" rel="noopener">${ic('info', 'i-sm')}诊断信息（反馈问题时附上）</a>`;
+const GPU_NOTE = {
+  pmu: 'i915 PMU 实测（与 intel_gpu_top 同源），约 10 秒均值。',
+  rc6: '按 GPU 省电态（RC6）驻留时间估算整体活跃度，不区分引擎；读取各引擎占用需要 i915 PMU。',
+  warm: '正在采样，约 10 秒后显示。',
+  none: '未能读取核显占用（i915 PMU 与 RC6 均不可用）。',
+};
 
 /* ---------------------------------------------------------------------
    04 COMPUTE — 每核 / 内存构成 / 显卡
@@ -172,20 +186,27 @@ defineModule({
     else { setText(x.swap, '未启用'); x.swapW.hidden = true; }
     // 显卡：只展示后端真实读到的字段
     const gpus = o.gpu || [], g = gpus[0], names = ((o.hardware || {}).gpu) || [];
-    const gsig = g ? g.name + g.type : 'none' + names.join();
+    const mode = g ? gpuMode(g) : '', engs = g ? gpuEngs(g) : [];
+    const gsig = g ? [g.name, g.type, mode, engs.map(e => e[0]).join(), +g.mem_total > 0].join('|') : 'none' + names.join();
     if (m.gsig !== gsig) {
       m.gsig = gsig;
+      const row = (k, l, cls = '') => `<div class="engine ${cls}"><span>${l}</span><div class="bar thin"><i data-ref="gb_${k}"></i></div><span class="v" data-ref="gv_${k}">--</span></div>`;
+      const rows = !g ? '' : mode === 'pmu' ? engs.map(([k, l]) => row(k, l)).join('') : mode === 'rc6' ? row('util', '活跃度（RC6 估算）', 'wide')
+        : mode === 'drv' ? row('util', '利用率') + (+g.mem_total > 0 ? row('mem', '显存') : '') : '';
       x.gpuCard.innerHTML = g ? `<div class="label">${GPU_TAG[g.type] || '显卡'}<span class="faint lbl-r">${esc(String(g.name || '').replace(/ \(.*\)/, ''))}</span></div>
         <div class="big-stat dnum" style="margin-top:14px"><span class="dm" data-ref="gU"></span><span class="unit">%</span><span class="sub mono" style="margin-left:8px" data-ref="gF"></span></div>
-        <div style="margin-top:18px" data-ref="gRows"></div><p class="sub" style="margin:14px 0 0" data-ref="gNote"></p>`
+        <div style="margin-top:18px">${rows}</div><p class="sub" style="margin:14px 0 0" data-ref="gNote"></p>${mode === 'rc6' || mode === 'none' ? diagLink() : ''}`
         : `<div class="label">显卡</div>${emptyHTML('未检测到可监控的显卡', names.length ? esc(names.join('、')) + ' · 无法读取实时状态' : '支持 Intel 核显 / NVIDIA（nvidia-smi）/ AMD（amdgpu）', 'gpu')}`;
       Object.assign(x, collect(x.gpuCard));
     }
     if (g) {
-      dnum(x.gU, g.util_avail ? g.util : null); inkTo(x.gU, ok(g.util) ? rampInk(g.util, 'gen') : '');
+      const has = g.util_avail && ok(g.util);
+      dnum(x.gU, has ? g.util : null); inkTo(x.gU, has ? rampInk(g.util, 'gen') : '');
       setText(x.gF, [ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' : '', ok(g.temp) ? F.int(g.temp) + '℃' : ''].filter(Boolean).join(' · '));
-      setHTML(x.gRows, `<div class="engine"><span>利用率</span><div class="bar thin"><i style="width:${clamp(+g.util || 0, 0, 100)}%;background:${ok(g.util) ? rampAt(g.util, 'gen') : ''}"></i></div><span class="v">${g.util_avail ? F.int(g.util) + '%' : '--'}</span></div>${+g.mem_total > 0 ? `<div class="engine"><span>显存</span><div class="bar thin"><i style="width:${clamp(+g.mem_pct || 0, 0, 100)}%;background:${rampAt(+g.mem_pct || 0, 'gen')}"></i></div><span class="v">${F.int(g.mem_pct)}%</span></div>` : ''}`);
-      setText(x.gNote, !g.util_avail ? '该显卡驱动未开放利用率读数。' : g.util_proxy ? '利用率为按 GPU 频率推算的近似值。' : +g.mem_total > 0 ? `显存 ${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}` : (gpus.length > 1 ? `另有 ${gpus.length - 1} 块显卡，详见处理器详情。` : ''));
+      const bar = (k, v) => { rampBar(x['gb_' + k], ok(v) ? clamp(+v, 0, 100) : 0, 'gen'); setText(x['gv_' + k], ok(v) ? F.int(v) + '%' : '--'); };
+      if (mode === 'pmu') engs.forEach(([k]) => bar(k, g.engines[k]));
+      else if (mode === 'rc6' || mode === 'drv') { bar('util', has ? g.util : null); if (+g.mem_total > 0) bar('mem', g.mem_pct); }
+      setText(x.gNote, mode !== 'drv' ? GPU_NOTE[mode] : !g.util_avail ? '该显卡驱动未开放利用率读数。' : +g.mem_total > 0 ? `显存 ${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}` : (gpus.length > 1 ? `另有 ${gpus.length - 1} 块显卡，详见处理器详情。` : ''));
     }
     setHTML(m.r.dek, `${pc.length ? `${pc.length} 个核心整体 <b>${F.int(cpu.percent)}%</b>，最忙的是 C${mx}（${F.int(pc[mx])}%）。` : ''}${T ? `内存实际占用 <b>${gb(mp.app)} GB</b>，另有 ${gb(mp.cache + mp.buf)} GB 缓存可随时释放。` : ''}`);
   },

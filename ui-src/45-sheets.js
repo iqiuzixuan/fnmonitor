@@ -80,7 +80,9 @@ const SHEETS = {
         setHTML(x.procs, procRows(((S.procs || {}).processes || []).slice(0, 8), 'cpu'));
         setHTML(x.spec, kvHTML([['型号', dash(hc.model || c.model)], ['核心 / 线程', `${dash(c.cores)} / ${dash(c.threads)}`], ['插槽', dash(c.sockets)], ['当前频率', ok(c.frequency_mhz) && c.frequency_mhz > 0 ? (c.frequency_mhz / 1000).toFixed(2) + ' GHz' : dash(null)], ['架构', dash(hc.arch || (o.system || {}).arch)]]));
         const gs = o.gpu || [];
-        setHTML(x.gpu, gs.length ? gs.map(g => kvHTML([['型号', esc(g.name) + (GPU_TAG[g.type] ? ` <span class="pill">${GPU_TAG[g.type]}</span>` : '')], ['利用率', g.util_avail ? F.d1(g.util) + '%' + (g.util_proxy ? '（按频率推算）' : '') : dash(null)], ['温度', ok(g.temp) ? F.d1(g.temp) + ' ℃' : dash(null)], ['频率', ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' : dash(null)], ['显存', +g.mem_total > 0 ? `${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}（${F.d1(g.mem_pct)}%）` : dash(null)]])).join('') : `<div class="card pad">${emptyHTML('未检测到可监控的显卡', esc(((o.hardware || {}).gpu || []).join('、')))}</div>`);
+        setHTML(x.gpu, gs.length ? gs.map(g => { const md = gpuMode(g), iu = gpuIntel(g);
+          const util = md === 'pmu' ? `${F.d1(g.util)}%<div class="sub">${gpuEngs(g).map(([k, l]) => `${l} ${F.int(g.engines[k])}%`).join(' · ')}</div>` : md === 'rc6' ? `${F.d1(g.util)}%（RC6 活跃度估算）` : md === 'warm' ? '<span class="faint">采样中…</span>' : g.util_avail && ok(g.util) ? F.d1(g.util) + '%' : iu ? `<span class="faint">未能读取</span> ${diagLink()}` : dash(null);
+          return kvHTML([['型号', esc(g.name) + (GPU_TAG[g.type] ? ` <span class="pill">${GPU_TAG[g.type]}</span>` : '')], ['利用率', util], ['温度', ok(g.temp) ? F.d1(g.temp) + ' ℃' : iu ? '<span class="faint">核显无独立温度读数（见 CPU 温度）</span>' : dash(null)], ['频率', ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' + (ok(g.freq_req_mhz) ? `<div class="sub">请求 ${F.int(g.freq_req_mhz)} MHz</div>` : '') : dash(null)], ['显存', +g.mem_total > 0 ? `${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}（${F.d1(g.mem_pct)}%）` : g.shared_memory ? '<span class="faint">与系统共享内存</span>' : dash(null)]]); }).join('') : `<div class="card pad">${emptyHTML('未检测到可监控的显卡', esc(((o.hardware || {}).gpu || []).join('、')))}</div>`);
       };
     },
   },
@@ -262,6 +264,7 @@ const SHEETS = {
       b.innerHTML = `<div class="sheet-hero"><div><div class="eyebrow">CPU</div><div class="dnum"><span class="dm" data-ref="cpu"></span><span class="unit">%</span></div></div><div style="text-align:right"><div class="eyebrow">内存</div><div class="dnum sec"><span class="dm" data-ref="mem"></span><span class="unit" data-ref="memU"></span></div></div></div>
         <div class="ctr-acts" data-ref="acts"></div>
         <div class="card chart-card"><div class="chart-head"><div class="chart-title">CPU · 近几分钟</div><span data-ref="state"></span></div><div style="height:64px" data-ref="sp"></div></div>
+        ${sec('实时网速', '<span class="faint">30 秒均值</span>')}<div class="stat-cells ctr-rates"><div class="stat-cell"><div class="eyebrow"><i class="ar dn">↓</i>下行 · 接收</div><div class="dnum"><span class="dm" data-ref="rx"></span><span class="unit" data-ref="rxU"></span></div></div><div class="stat-cell"><div class="eyebrow"><i class="ar up">↑</i>上行 · 发送</div><div class="dnum"><span class="dm" data-ref="tx"></span><span class="unit" data-ref="txU"></span></div></div></div><p class="sub ctr-net-note" data-ref="netN"></p>
         ${sec('详情')}<div data-ref="kv"></div>`;
       const x = collect(b), sp = makeSpark(); x.sp.append(sp);
       x.acts.addEventListener('click', e => { const btn = e.target.closest('[data-act]'); if (btn) Docker.act(btn.dataset.id, btn.dataset.name, btn.dataset.act, btn); });
@@ -274,8 +277,11 @@ const SHEETS = {
         setHTML(x.acts, pend ? `<span class="spin"></span><span class="pending-t">${Docker.PEND[pend]}</span>` : (run
           ? `<button class="btn" type="button" data-act="restart" ${ids}>${ic('restart')}重启</button><button class="btn danger" type="button" data-act="stop" ${ids}>${ic('stop')}停止</button>`
           : `<button class="btn primary" type="button" data-act="start" ${ids}>${ic('play')}启动</button>`) + (run && hp ? `<a class="btn ghost" href="${esc(location.protocol + '//' + location.hostname + ':' + hp + '/')}" target="_blank" rel="noopener noreferrer">${ic('ext')}打开 :${esc(hp)}</a>` : ''));
+        const rOk = ctrRateOk(c);
+        dnumU(x.rx, x.rxU, rOk ? +c.rx_rate : null, F.rate); dnumU(x.tx, x.txU, rOk ? +c.tx_rate : null, F.rate);
+        setText(x.netN, !run ? '容器未运行' : c.net_host ? 'host 网络模式：与宿主机共用网卡，Docker 不单独统计' : !rOk ? '采样中，约 30 秒后显示' : c.net_src === 'stats' ? '按 docker stats 的累计读数差分估算（只有 3 位有效数字，低速时偏粗）' : '容器网络命名空间计数器差分，精确到字节');
         const bb = S.ctrBuf[c.id]; sp.set([{ values: run && bb && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...(bb || [0])), live: run ? 'ink' : 'none' });
-        setHTML(x.kv, kvHTML([['镜像', `<span class="mono">${esc(c.image)}</span>`], ['容器 ID', `<span class="mono">${esc(c.id)}</span>`], ['状态', esc(zhStatus(c.status) || c.state || '--')], ['端口', ctrPorts(c.ports).length ? ctrPorts(c.ports).map(p => `<span class="port">${esc(p)}</span>`).join(' ') : '<span class="faint">无映射</span>'], ['内存', run && c.mem_usage ? `${esc(c.mem_usage)}${c.mem_percent ? `（${esc(c.mem_percent)}%）` : ''}` : '<span class="faint">—</span>'], ['网络 I/O', run && c.net ? esc(c.net) : '<span class="faint">—</span>'], ['创建时间', dash(c.created)]]));
+        setHTML(x.kv, kvHTML([['镜像', `<span class="mono">${esc(c.image)}</span>`], ['容器 ID', `<span class="mono">${esc(c.id)}</span>`], ['状态', esc(c.status_zh || zhStatus(c.status) || c.state || '--')], ['端口', ctrPorts(c.ports).length ? ctrPorts(c.ports).map(p => `<span class="port">${esc(p)}</span>`).join(' ') : '<span class="faint">无映射</span>'], ['内存', run && c.mem_usage ? `${esc(c.mem_usage)}${c.mem_percent ? `（${esc(c.mem_percent)}%）` : ''}` : '<span class="faint">—</span>'], ['累计流量', run && !c.net_host && (ok(c.net_in_bytes) || c.net) ? (ok(c.net_in_bytes) && ok(c.net_out_bytes) ? `↓ ${F.bytesStr(c.net_in_bytes)} · ↑ ${F.bytesStr(c.net_out_bytes)}<div class="sub">自容器启动</div>` : esc(c.net)) : '<span class="faint">—</span>'], ['创建时间', dash(c.created)]]));
       };
     },
   },

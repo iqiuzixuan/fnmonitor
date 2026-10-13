@@ -59,6 +59,15 @@ const actBtns = c => {
     ? `<button class="act" type="button" data-act="restart" ${ids} title="重启" aria-label="重启 ${esc(c.name)}">${ic('restart')}</button><button class="act danger" type="button" data-act="stop" ${ids} title="停止" aria-label="停止 ${esc(c.name)}">${ic('stop')}</button>`
     : `<button class="act go" type="button" data-act="start" ${ids} title="启动" aria-label="启动 ${esc(c.name)}">${ic('play')}</button>`;
 };
+/** 容器实时网速（后端相邻两次 docker 采样差分，约 30 秒均值）：↓ 下行蓝 · ↑ 上行梅紫红 */
+const ctrRateOk = c => ctrRun(c) && ok(c.rx_rate) && ok(c.tx_rate);
+const ctrNetTxt = c => !ctrRun(c) ? '—' : c.net_host ? '宿主网络' : ctrRateOk(c) ? `↓ ${F.rateStr(c.rx_rate)} · ↑ ${F.rateStr(c.tx_rate)}` : '采样中';
+function ctrNetHTML(c) {
+  if (!ctrRun(c)) return '<span class="faint">—</span>';
+  if (c.net_host) return '<span class="faint" title="host 网络模式与宿主机共用网卡，Docker 不单独统计流量">宿主网络</span>';
+  if (!ctrRateOk(c)) return '<span class="faint" title="需要两次采样（约 30 秒）才能算出速率">采样中…</span>';
+  return `<b><i class="ar dn">↓</i>${esc(F.rateStr(c.rx_rate))}</b><small><i class="ar up">↑</i>${esc(F.rateStr(c.tx_rate))}</small>`;
+}
 /** 每次拿到新的容器数据时记录 CPU，用于行内迷你趋势 */
 function feedDocker(d) {
   if (!dockerOk(d)) return;
@@ -81,7 +90,7 @@ defineModule({
         <div class="stat-cell"><div class="eyebrow">容器内存</div><div class="dnum"><span class="dm" data-ref="sMem"></span><span class="unit" data-ref="sMemU"></span></div><div class="sub" data-ref="sMemT"></div></div>
         <div class="stat-cell"><div class="eyebrow">镜像</div><div class="dnum"><span class="dm" data-ref="sImg"></span></div><div class="sub">本地镜像</div></div>
       </div>
-      <div class="card ctr-list"><div class="ctr ctr-head" data-ref="head" hidden><span>容器</span><span>端口</span><span>CPU · 近几分钟</span><span>内存</span><span class="ctr-up">运行时长</span><span></span></div><div data-ref="list"></div>
+      <div class="card ctr-list"><div class="ctr ctr-head" data-ref="head" hidden><span>容器</span><span>端口</span><span>CPU · 近几分钟</span><span>内存</span><span class="ctr-net">网络 · 30 秒均值</span><span class="ctr-up">运行时长</span><span></span></div><div data-ref="list"></div>
       <div class="empty" data-ref="empty" hidden><svg class="art" viewBox="0 0 120 84" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M60 10 88 25v30L60 70 32 55V25L60 10Z" stroke-dasharray="3 4"/><path d="M32 25l28 15 28-15M60 40v30"/><circle cx="92" cy="62" r="9"/><path d="m98.5 68.5 7 7"/></svg><b data-ref="emptyT">没有匹配的容器</b><span>换个关键词，或查看全部容器。</span><button class="btn" type="button" data-ref="clear">清除筛选</button></div>
       <div data-ref="na"></div></div>`;
     m.x = collect(body); m.rows = {};
@@ -106,6 +115,7 @@ defineModule({
           <div class="ports">${ctrPorts(c.ports).length ? ctrPorts(c.ports).slice(0, 4).map(p => `<span class="port">${esc(p)}</span>`).join('') + (ctrPorts(c.ports).length > 4 ? `<span class="port">+${ctrPorts(c.ports).length - 4}</span>` : '') : '<span class="faint" style="font-size:12px">无端口映射</span>'}</div>
           <div class="ctr-cpu"><div class="spk" data-ref="sp"></div><b data-ref="cpu"></b></div>
           <div class="ctr-mem"><b data-ref="mem"></b><small data-ref="memp"></small></div>
+          <div class="ctr-net" data-ref="net"></div>
           <div class="ctr-up" data-ref="up"></div>
           <div class="acts" data-ref="acts"></div>
         </div>`);
@@ -120,6 +130,7 @@ defineModule({
       setText(r.cpu, on && cpu != null ? F.d1(cpu) + '%' : '—');
       setText(r.mem, on && mem != null ? F.bytesStr(mem) : '—'); setText(r.memp, on && c.mem_percent ? c.mem_percent + '%' : '');
       row._sp.set([{ values: on && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...bb), live: on ? 'ink' : 'none' });
+      setHTML(r.net, ctrNetHTML(c));
       setHTML(r.up, pend ? `<span class="pending-t">${Docker.PEND[pend]}</span>` : on ? esc(zhDur(c.uptime || c.status).replace(/^运行\s*/, '')) : `<span class="faint">${esc(zhDur(c.uptime) || c.state || '已停止')}</span>`);
       setHTML(r.acts, pend ? '<span class="spin" aria-label="处理中"></span>' : actBtns(c));
     });

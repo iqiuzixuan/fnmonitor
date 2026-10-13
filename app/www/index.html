@@ -373,7 +373,7 @@ to{opacity:1;transform:none}
 .field input{flex:1;border:0;outline:0;background:transparent;color:var(--ink-1);min-width:0;font-size:14px}
 .field input::placeholder{color:var(--ink-3)}
 .ctr-list{padding:6px var(--s6)}
-.ctr{display:grid;grid-template-columns:minmax(180px,1.5fr) minmax(120px,1fr) 150px 110px 110px 96px;gap:var(--s5);align-items:center;padding:15px 0;border-top:1px solid var(--line);cursor:pointer;transition:opacity var(--dur-2)}
+.ctr{display:grid;grid-template-columns:minmax(180px,1.5fr) minmax(120px,1fr) 150px 104px 118px 104px 96px;gap:var(--s5);align-items:center;padding:15px 0;border-top:1px solid var(--line);cursor:pointer;transition:opacity var(--dur-2)}
 .ctr:first-child{border-top:0}
 .ctr-head{cursor:default;font-size:var(--fs-xs);color:var(--ink-3);padding:14px 0 10px}
 .ctr-name{display:flex;align-items:center;gap:12px;min-width:0}
@@ -390,11 +390,16 @@ to{opacity:1;transform:none}
 .port.hit{background:var(--accent-soft);color:var(--accent)}
 .ctr-cpu{display:grid;grid-template-columns:1fr 52px;gap:10px;align-items:center}
 .ctr-cpu .spk{height:24px}
-.ctr-cpu b,.ctr-mem b{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
-.ctr-mem{font-variant-numeric:tabular-nums}
-.ctr-mem small,.ctr-up small{display:block;color:var(--ink-3);font-size:11.5px}
+.ctr-cpu b,.ctr-mem b,.ctr-net b{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+.ctr-mem,.ctr-net{font-variant-numeric:tabular-nums}
+.ctr-mem small,.ctr-up small,.ctr-net small{display:block;color:var(--ink-3);font-size:11.5px}
+.ctr-net b,.ctr-net small{white-space:nowrap}
+.ctr-net>.faint{font-size:12px}
+.ar{font-style:normal;font-weight:600;margin-right:4px}
+.ar.dn{color:var(--e-blue)}
+.ar.up{color:var(--e-coral)}
 .ctr-up{font-size:var(--fs-sm);color:var(--ink-2)}
-.ctr.off .ctr-cpu,.ctr.off .ctr-mem{opacity:.4}
+.ctr.off .ctr-cpu,.ctr.off .ctr-mem,.ctr.off .ctr-net{opacity:.4}
 .acts{display:flex;justify-content:flex-end;gap:2px}
 .act{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;color:var(--ink-2);transition:background var(--dur-1),color var(--dur-1)}
 .act:hover{background:var(--fill-1);color:var(--ink-1)}
@@ -571,7 +576,7 @@ body:not(.editing) .module.off{display:none}
 @media (max-width: 1120px){.hero{grid-template-columns:auto minmax(0,1fr)}
 .clock-card{grid-column:1 / -1;display:grid;grid-template-columns:auto 1fr;gap:var(--s6);align-items:center}
 .clock-card .wx{margin:0;padding:0 0 0 var(--s6);border-top:0;border-left:1px solid var(--line)}
-.ctr{grid-template-columns:minmax(160px,1.4fr) minmax(110px,1fr) 130px 96px 96px}
+.ctr{grid-template-columns:minmax(160px,1.4fr) minmax(110px,1fr) 130px 96px 112px 96px}
 .ctr .ctr-up{display:none}
 }
 @media (max-width: 960px){:root{--section-gap:64px;--page-pad:24px;--fs-hero:52px}
@@ -584,7 +589,7 @@ body:not(.editing) .module.off{display:none}
 .ctr-head{display:none !important}
 .ctr{grid-template-columns:minmax(0,1fr) auto;gap:10px 16px}
 .ctr .ports{grid-column:1 / -1;order:3}
-.ctr .ctr-cpu,.ctr .ctr-mem{display:none}
+.ctr .ctr-cpu,.ctr .ctr-mem,.ctr .ctr-net{display:none}
 }
 @media (max-width: 640px){:root{--page-pad:16px;--section-gap:52px;--fs-hero:40px;--fs-display:27px;--fs-h2:22px}
 .topbar-in{grid-template-columns:1fr auto;height:56px}
@@ -1190,6 +1195,12 @@ a{color:var(--ink-1)}
 .th-pair .numfield .u{min-width:18px}
 [data-theme="dark"] .bays::after{opacity:.35}
 .module:not(.in-view) .skel,.module:not(.in-view) .fan-ico svg,.module:not(.in-view) .bay-zz .dm{animation-play-state:paused}
+.est-pill{height:18px;padding:0 7px;margin-left:6px;font-size:10.5px;vertical-align:1px}
+.engine.wide{grid-template-columns:minmax(64px,auto) 1fr 40px}
+.diag-link{margin:8px 0 0 -12px;color:var(--ink-3)}
+.diag-link:hover{background:var(--fill-1);color:var(--ink-1)}
+dd .diag-link{margin:0;height:24px}
+.ctr-net-note{margin:10px 2px 0}
 </style>
 </head>
 <body>
@@ -2619,6 +2630,18 @@ setText(t.v, F.int(v)); inkTo(t.v, rampInk(v, 'cpu'));
 });
 }
 const GPU_TAG = { igpu: '核显', nvidia: 'NVIDIA', amd: 'AMD' };
+const GPU_ENG = [['render', '渲染'], ['video', '视频'], ['video_enhance', '视频增强'], ['blitter', '复制'], ['compute', '计算']];
+const GPU_DIAG = '/api/gpu?diag=1';
+const gpuIntel = g => g && g.vendor === '8086';
+const gpuEngs = g => GPU_ENG.filter(([k]) => g.engines && ok(g.engines[k]));
+const gpuMode = g => !gpuIntel(g) ? 'drv' : g.warming ? 'warm' : g.util_source === 'pmu' && gpuEngs(g).length ? 'pmu' : g.util_source === 'rc6' && ok(g.util) ? 'rc6' : 'none';
+const diagLink = () => `<a class="link-btn diag-link" href="${GPU_DIAG}" target="_blank" rel="noopener">${ic('info', 'i-sm')}诊断信息（反馈问题时附上）</a>`;
+const GPU_NOTE = {
+pmu: 'i915 PMU 实测（与 intel_gpu_top 同源），约 10 秒均值。',
+rc6: '按 GPU 省电态（RC6）驻留时间估算整体活跃度，不区分引擎；读取各引擎占用需要 i915 PMU。',
+warm: '正在采样，约 10 秒后显示。',
+none: '未能读取核显占用（i915 PMU 与 RC6 均不可用）。',
+};
 defineModule({
 id: 'compute', page: 'overview', kicker: 'COMPUTE', title: '处理器 · 内存 · 显卡', dek: '每核使用率、内存构成与显卡状态',
 actions: () => detailBtn('cpu'),
@@ -2672,20 +2695,27 @@ setHTML(x.mLeg, memLegHTML(mp, mc));
 if (+mem.swap_total > 0) { setText(x.swap, `${gb(mem.swap_used)} / ${gb(mem.swap_total)} GB`); x.swapW.hidden = false; rampBar(x.swapBar, mem.swap_used / mem.swap_total * 100, 'gen'); }
 else { setText(x.swap, '未启用'); x.swapW.hidden = true; }
 const gpus = o.gpu || [], g = gpus[0], names = ((o.hardware || {}).gpu) || [];
-const gsig = g ? g.name + g.type : 'none' + names.join();
+const mode = g ? gpuMode(g) : '', engs = g ? gpuEngs(g) : [];
+const gsig = g ? [g.name, g.type, mode, engs.map(e => e[0]).join(), +g.mem_total > 0].join('|') : 'none' + names.join();
 if (m.gsig !== gsig) {
 m.gsig = gsig;
+const row = (k, l, cls = '') => `<div class="engine ${cls}"><span>${l}</span><div class="bar thin"><i data-ref="gb_${k}"></i></div><span class="v" data-ref="gv_${k}">--</span></div>`;
+const rows = !g ? '' : mode === 'pmu' ? engs.map(([k, l]) => row(k, l)).join('') : mode === 'rc6' ? row('util', '活跃度（RC6 估算）', 'wide')
+: mode === 'drv' ? row('util', '利用率') + (+g.mem_total > 0 ? row('mem', '显存') : '') : '';
 x.gpuCard.innerHTML = g ? `<div class="label">${GPU_TAG[g.type] || '显卡'}<span class="faint lbl-r">${esc(String(g.name || '').replace(/ \(.*\)/, ''))}</span></div>
 <div class="big-stat dnum" style="margin-top:14px"><span class="dm" data-ref="gU"></span><span class="unit">%</span><span class="sub mono" style="margin-left:8px" data-ref="gF"></span></div>
-<div style="margin-top:18px" data-ref="gRows"></div><p class="sub" style="margin:14px 0 0" data-ref="gNote"></p>`
+<div style="margin-top:18px">${rows}</div><p class="sub" style="margin:14px 0 0" data-ref="gNote"></p>${mode === 'rc6' || mode === 'none' ? diagLink() : ''}`
 : `<div class="label">显卡</div>${emptyHTML('未检测到可监控的显卡', names.length ? esc(names.join('、')) + ' · 无法读取实时状态' : '支持 Intel 核显 / NVIDIA（nvidia-smi）/ AMD（amdgpu）', 'gpu')}`;
 Object.assign(x, collect(x.gpuCard));
 }
 if (g) {
-dnum(x.gU, g.util_avail ? g.util : null); inkTo(x.gU, ok(g.util) ? rampInk(g.util, 'gen') : '');
+const has = g.util_avail && ok(g.util);
+dnum(x.gU, has ? g.util : null); inkTo(x.gU, has ? rampInk(g.util, 'gen') : '');
 setText(x.gF, [ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' : '', ok(g.temp) ? F.int(g.temp) + '℃' : ''].filter(Boolean).join(' · '));
-setHTML(x.gRows, `<div class="engine"><span>利用率</span><div class="bar thin"><i style="width:${clamp(+g.util || 0, 0, 100)}%;background:${ok(g.util) ? rampAt(g.util, 'gen') : ''}"></i></div><span class="v">${g.util_avail ? F.int(g.util) + '%' : '--'}</span></div>${+g.mem_total > 0 ? `<div class="engine"><span>显存</span><div class="bar thin"><i style="width:${clamp(+g.mem_pct || 0, 0, 100)}%;background:${rampAt(+g.mem_pct || 0, 'gen')}"></i></div><span class="v">${F.int(g.mem_pct)}%</span></div>` : ''}`);
-setText(x.gNote, !g.util_avail ? '该显卡驱动未开放利用率读数。' : g.util_proxy ? '利用率为按 GPU 频率推算的近似值。' : +g.mem_total > 0 ? `显存 ${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}` : (gpus.length > 1 ? `另有 ${gpus.length - 1} 块显卡，详见处理器详情。` : ''));
+const bar = (k, v) => { rampBar(x['gb_' + k], ok(v) ? clamp(+v, 0, 100) : 0, 'gen'); setText(x['gv_' + k], ok(v) ? F.int(v) + '%' : '--'); };
+if (mode === 'pmu') engs.forEach(([k]) => bar(k, g.engines[k]));
+else if (mode === 'rc6' || mode === 'drv') { bar('util', has ? g.util : null); if (+g.mem_total > 0) bar('mem', g.mem_pct); }
+setText(x.gNote, mode !== 'drv' ? GPU_NOTE[mode] : !g.util_avail ? '该显卡驱动未开放利用率读数。' : +g.mem_total > 0 ? `显存 ${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}` : (gpus.length > 1 ? `另有 ${gpus.length - 1} 块显卡，详见处理器详情。` : ''));
 }
 setHTML(m.r.dek, `${pc.length ? `${pc.length} 个核心整体 <b>${F.int(cpu.percent)}%</b>，最忙的是 C${mx}（${F.int(pc[mx])}%）。` : ''}${T ? `内存实际占用 <b>${gb(mp.app)} GB</b>，另有 ${gb(mp.cache + mp.buf)} GB 缓存可随时释放。` : ''}`);
 },
@@ -2767,6 +2797,31 @@ const n = clamp(Math.floor((Date.now() - new Date(firstDay.getFullYear(), firstD
 const ds = lastDays(n);
 return { days: ds, rows: ds.map((d, i) => Object.assign({ dim: i !== ds.length - 1 }, ...keys.map(k => ({ [k]: (daysMap[k][dayKey(d)] || 0) })))) };
 }
+const Daily = {
+at: 0, data: null, p: null,
+get(maxAge = 300000) {
+if (Date.now() - this.at < maxAge) return Promise.resolve(this.data);
+if (this.p) return this.p;
+this.p = API.get('/api/daily?days=' + DAY_BARS).then(j => (j && Array.isArray(j.days) && j.days.length ? j : null)).catch(() => null)
+.then(j => { this.data = j; this.at = Date.now(); this.p = null; return j; });
+return this.p;
+},
+};
+function dailyFromApi(j, pick) {
+const ds = j.days, first = ds.findIndex(d => d.has_data && pick(d));
+if (first < 0) return null;
+const list = ds.slice(first), days = list.map(d => { const [y, mo, da] = d.day.split('-').map(Number); return new Date(y, mo - 1, da); });
+return { list, days, rows: list.map((d, i) => Object.assign({ dim: i !== list.length - 1 }, pick(d) || {})) };
+}
+const nul = (v, f) => v == null ? '无数据' : f(v);
+function avgW(o) {
+const ds = ((Daily.data || {}).days || []).filter(d => ok(d.kwh) && +d.power_h > 0);
+const h = ds.reduce((a, d) => a + +d.power_h, 0);
+if (h >= 1) return { w: ds.reduce((a, d) => a + +d.kwh, 0) * 1000 / h, basis: `近 ${ds.length} 天平均`, n: ds.length };
+const hp = Hist.peek('power', 'all'), pts = (hp && hp.points) || [];
+if (pts.length > 5) return { w: pts.reduce((a, p) => a + (+p[1] || 0), 0) / pts.length, basis: '功率历史平均' };
+return pwrOk(o) ? { w: +o.power.total, basis: '当前功率' } : null;
+}
 const barOpts = (days, series, fmt, h) => ({
 height: h, series, fmt,
 title: i => days[i] ? (days[i].getMonth() + 1) + '/' + days[i].getDate() + (i === days.length - 1 ? ' · 今天' : '') : '',
@@ -2784,8 +2839,8 @@ return parts;
 }
 const ppI = c => c === 'hatch' ? '<i class="hatch"></i>' : `<i style="background:${c}"></i>`;
 const SRC_TXT = { rapl: '硬件 RAPL', estimated: '模型估算' };
-const avgPower = o => { const h = Hist.peek('power', 'all'), pts = (h && h.points) || []; if (pts.length > 5) return pts.reduce((a, p) => a + (+p[1] || 0), 0) / pts.length; return pwrOk(o) ? +o.power.total : null; };
-const monthProj = (mk, o) => { const w = avgPower(o); if (!ok(mk) || w == null) return null; const d = new Date(), end = new Date(d.getFullYear(), d.getMonth() + 1, 1); return { kwh: mk + w * (end - d) / 3.6e9, w }; };
+const monthProj = (mk, o) => { const a = avgW(o); if (!ok(mk) || !a) return null; const d = new Date(), end = new Date(d.getFullYear(), d.getMonth() + 1, 1); return { kwh: mk + a.w * (end - d) / 3.6e9, w: a.w, basis: a.basis }; };
+const yearProj = o => { const a = avgW(o); return a ? { kwh: a.w * 8.76, w: a.w, basis: a.basis } : null; };
 defineModule({
 id: 'energy', page: 'overview', dc: 'pwr', kicker: 'ENERGY', title: '能耗', dek: '实时功耗、用电量与电费',
 actions: () => detailBtn('power'),
@@ -2802,22 +2857,33 @@ body.innerHTML = `<div class="energy">
 <div class="stat-cell"><div class="eyebrow">今日用电</div><div class="dnum"><span class="dm" data-ref="tk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="tc"></div></div>
 <div class="stat-cell"><div class="eyebrow">本月用电</div><div class="dnum"><span class="dm" data-ref="mk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="mc"></div></div>
 <div class="stat-cell"><div class="eyebrow">本月预计电费</div><div class="dnum"><span class="dm" data-ref="pc"></span></div><div class="sub" data-ref="pk"></div></div>
-<div class="stat-cell"><div class="eyebrow">开机以来</div><div class="dnum"><span class="dm" data-ref="bk"></span><span class="unit">kWh</span></div><div class="sub" data-ref="bc"></div></div>
+<div class="stat-cell"><div class="eyebrow">全年估算<span class="pill est-pill">估算</span></div><div class="dnum"><span class="dm" data-ref="yc"></span></div><div class="sub" data-ref="yk"></div></div>
 </div>
 </div>
 <div class="card chart-card" style="margin-top:16px">
-<div class="chart-head"><div class="chart-title" data-ref="barT">每日用电</div><div class="chart-legend"><span><span class="lk"><i class="kb0" style="--k:var(--e-teal)"></i>每日 kWh · 按功率历史积分</span></span></div></div>
+<div class="chart-head"><div class="chart-title" data-ref="barT">每日用电</div><div class="chart-legend"><span><span class="lk"><i class="kb0" style="--k:var(--e-teal)"></i><span data-ref="barL">每日 kWh · 按功率历史积分</span></span></span></div></div>
 <div data-ref="bars"></div><div class="chart-empty-s" data-ref="barE" hidden></div>
 </div>`;
 m.x = collect(body);
+const SER = [{ key: 'kwh', label: '用电', color: 'var(--e-teal)' }], fmt = v => nul(v, x => F.kwh(x) + ' kWh');
+const show = (days, rows, title, legend, extra) => {
+if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, SER, fmt, 132));
+Object.assign(m.bars.opt, barOpts(days, SER, fmt, 132));
+if (extra) { const t0 = m.bars.opt.title; m.bars.opt.title = i => t0(i) + extra(i); }
+const any = !!rows.length; m.x.barE.hidden = any; m.x.bars.hidden = !any;
+setText(m.x.barT, any ? title(days.length) : '近 30 天用电'); setText(m.x.barL, legend);
+if (any) m.bars.setData(rows);
+};
 m.loadBars = async () => {
+const j = await Daily.get(), r = j && dailyFromApi(j, d => ok(d.kwh) ? { kwh: +d.kwh } : null);
+setText(m.x.barE, '暂无功率数据：采集满一段时间后这里会显示每天的用电量');
+if (j) {
+if (!r) return show([], [], () => '', '每日 kWh');
+return show(r.days, r.rows, n => `近 ${n} 天用电`, '每日 kWh · 功率历史积分', i => { const d = r.list[i]; if (!d) return ''; const part = ok(d.power_h) && d.power_h < 23.5 ? ` · 数据 ${F.d1(d.power_h)} 小时` : ''; return (ok(d.cost) ? ' · ' + F.yuan(d.cost) : '') + part; });
+}
 const d = await Hist.get('power', 'all', 600000).catch(() => null), pts = (d && d.points) || [];
 const map = { kwh: dailyIntegral(pts, 1 / 3.6e6) }, { days, rows } = dailyRows(map, ['kwh'], pts.length ? pts[0][0] : 0);
-if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, [{ key: 'kwh', label: '用电', color: 'var(--e-teal)' }], v => F.kwh(v) + ' kWh', 132));
-Object.assign(m.bars.opt, barOpts(days, m.bars.opt.series, m.bars.opt.fmt, 132));
-const any = pts.length > 1; m.x.barE.hidden = any; m.x.bars.hidden = !any;
-setText(m.x.barE, '暂无功率历史，无法统计每日用电'); setText(m.x.barT, `近 ${days.length} 天用电`);
-if (any) m.bars.setData(rows);
+show(pts.length > 1 ? days : [], pts.length > 1 ? rows : [], n => `近 ${n} 天用电`, '每日 kWh · 按功率历史积分');
 };
 },
 update(o, m) {
@@ -2834,8 +2900,10 @@ const en = ps && ps.energy, co = ps && ps.cost;
 dnum(x.tk, en ? en.today_kwh : null, F.kwh); setText(x.tc, co ? '电费 ' + F.yuan(co.today_yuan) : '--');
 dnum(x.mk, en ? en.month_kwh : null, F.kwh); setText(x.mc, co ? '电费 ' + F.yuan(co.month_yuan) : '--');
 const pj = en ? monthProj(en.month_kwh, o) : null, pk = pj ? pj.kwh : null;
-if (x.pc) dot(x.pc).set(pk != null && ok(rate) ? F.yuan(pk * rate) : '--'); setText(x.pk, pk != null ? `约 ${F.kwh(pk)} kWh · 剩余天数按平均 ${F.d1(pj.w)} W` : '本月数据不足');
-dnum(x.bk, en ? en.boot_kwh : null, F.kwh); setText(x.bc, en && ok(rate) ? `电费 ${F.yuan(en.boot_kwh * rate)} · 按当前功率估` : '--');
+if (x.pc) dot(x.pc).set(pk != null && ok(rate) ? F.yuan(pk * rate) : '--'); setText(x.pk, pk != null ? `约 ${F.kwh(pk)} kWh · 剩余天数按${pj.basis} ${F.d1(pj.w)} W` : '本月数据不足');
+const yp = has || Daily.data ? yearProj(o) : null;
+if (x.yc) dot(x.yc).set(yp && ok(rate) ? F.yuan(yp.kwh * rate) : '--');
+setText(x.yk, yp ? `约 ${F.int(yp.kwh)} kWh · ${yp.basis} ${F.d1(yp.w)} W × 8760 小时` : '暂无可用的功率数据');
 const sl = disksOf(o).filter(isSleep).length, dw = S.cfg && S.cfg.power_disk_typical_w;
 setHTML(m.r.dek, !has ? '功耗不可用。' : `此刻 <b>${F.d1(p.total)} W</b>${ok(rate) ? `，按电价 ${esc(rate)} 元/kWh` : ''}${pk != null && ok(rate) ? `，本月电费预计 <b>${F.yuan(pk * rate)}</b>` : ''}。${sl ? `${sl} 块硬盘休眠中${ok(dw) ? `，每块约省 ${esc(dw)} W` : ''}。` : ''}`);
 if (!m.barsAt || Date.now() - m.barsAt > 600000) { m.barsAt = Date.now(); m.loadBars(); }
@@ -2872,15 +2940,22 @@ body.innerHTML = `<div class="grid g-2">
 <div data-ref="bars"></div><div class="chart-empty-s" data-ref="barE" hidden></div>
 </div>`;
 m.x = collect(body);
+const SER = [{ key: 'rx', label: '下行', color: 'var(--e-blue)' }, { key: 'tx', label: '上行', color: 'var(--e-coral)' }], fmt = v => nul(v, F.bytesStr);
+const show = (days, rows, title) => {
+m.daily = rows;
+if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, SER, fmt, 140));
+Object.assign(m.bars.opt, barOpts(days, SER, fmt, 140));
+const any = !!rows.length; m.x.barE.hidden = any; m.x.bars.hidden = !any;
+setText(m.x.barT, any ? title : '近 30 天流量');
+if (any) m.bars.setData(rows);
+};
 m.loadBars = async () => {
+const j = await Daily.get(), r = j && dailyFromApi(j, d => ok(d.rx) ? { rx: +d.rx, tx: +d.tx || 0 } : null);
+setText(m.x.barE, '暂无流量数据：采集满一段时间后这里会显示每天的上下行流量');
+if (j) return r ? show(r.days, r.rows, `近 ${r.days.length} 天流量 · ${j.exclude_bridge ? '物理网口' : '全部网口（含 Docker 网桥）'}，按网口计数器`) : show([], [], '');
 const d = await Hist.get('net', 'all', 600000).catch(() => null), rx = (d && d.rx) || [], tx = (d && d.tx) || [];
 const map = { rx: dailyIntegral(rx, 1), tx: dailyIntegral(tx, 1) }, { days, rows } = dailyRows(map, ['rx', 'tx'], rx.length ? rx[0][0] : 0);
-m.daily = rows;
-if (!m.bars) m.bars = new BarChart(m.x.bars, barOpts(days, [{ key: 'rx', label: '下行', color: 'var(--e-blue)' }, { key: 'tx', label: '上行', color: 'var(--e-coral)' }], F.bytesStr, 140));
-Object.assign(m.bars.opt, barOpts(days, m.bars.opt.series, F.bytesStr, 140));
-const any = rx.length > 1; m.x.barE.hidden = any; m.x.bars.hidden = !any;
-setText(m.x.barE, '暂无网络历史，无法统计每日流量'); setText(m.x.barT, `近 ${days.length} 天流量 · 物理网口，按速率历史积分`);
-if (any) m.bars.setData(rows);
+show(rx.length > 1 ? days : [], rx.length > 1 ? rows : [], `近 ${days.length} 天流量 · 物理网口，按速率历史积分`);
 };
 },
 update(o, m) {
@@ -2910,7 +2985,7 @@ const cs = (t && t.containers) || [], dk = S.docker || o.docker;
 setHTML(x.rank, cs.length ? rankHTML(cs, 6) : emptyHTML(dockerOk(dk) ? '没有运行中的容器' : 'Docker 不可用', dockerOk(dk) ? '' : esc((dk && dk.error) || ''), 'box'));
 if (!m.barsAt || Date.now() - m.barsAt > 600000) { m.barsAt = Date.now(); m.loadBars(); }
 let dek = tt ? `今天下载 <b>${F.bytesStr(tt.today_rx)}</b>、上传 ${F.bytesStr(tt.today_tx)}` : '流量统计加载中';
-const prev = (m.daily || []).slice(0, -1).filter(r => r.rx > 0);
+const prev = (m.daily || []).slice(0, -1).filter(r => +r.rx > 0);
 if (tt && prev.length >= 2) { const avg = prev.reduce((a, r) => a + r.rx, 0) / prev.length, diff = avg ? (tt.today_rx - avg) / avg * 100 : 0; if (avg) dek += `，${diff >= 0 ? '高于' : '低于'} ${prev.length} 天日均 ${F.int(Math.abs(diff))}%`; }
 dek += '。';
 if (cs.length) { const total = cs.reduce((a, c) => a + (+c.total_bytes || 0), 0); if (total) dek += `${esc(cs[0].name)} 是累计流量最大的容器，占 ${F.int(cs[0].total_bytes / total * 100)}%。`; }
@@ -3085,7 +3160,9 @@ dnum(x.v, c.percent); inkTo(x.v, ok(c.percent) ? rampInk(c.percent, 'cpu') : '')
 setHTML(x.procs, procRows(((S.procs || {}).processes || []).slice(0, 8), 'cpu'));
 setHTML(x.spec, kvHTML([['型号', dash(hc.model || c.model)], ['核心 / 线程', `${dash(c.cores)} / ${dash(c.threads)}`], ['插槽', dash(c.sockets)], ['当前频率', ok(c.frequency_mhz) && c.frequency_mhz > 0 ? (c.frequency_mhz / 1000).toFixed(2) + ' GHz' : dash(null)], ['架构', dash(hc.arch || (o.system || {}).arch)]]));
 const gs = o.gpu || [];
-setHTML(x.gpu, gs.length ? gs.map(g => kvHTML([['型号', esc(g.name) + (GPU_TAG[g.type] ? ` <span class="pill">${GPU_TAG[g.type]}</span>` : '')], ['利用率', g.util_avail ? F.d1(g.util) + '%' + (g.util_proxy ? '（按频率推算）' : '') : dash(null)], ['温度', ok(g.temp) ? F.d1(g.temp) + ' ℃' : dash(null)], ['频率', ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' : dash(null)], ['显存', +g.mem_total > 0 ? `${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}（${F.d1(g.mem_pct)}%）` : dash(null)]])).join('') : `<div class="card pad">${emptyHTML('未检测到可监控的显卡', esc(((o.hardware || {}).gpu || []).join('、')))}</div>`);
+setHTML(x.gpu, gs.length ? gs.map(g => { const md = gpuMode(g), iu = gpuIntel(g);
+const util = md === 'pmu' ? `${F.d1(g.util)}%<div class="sub">${gpuEngs(g).map(([k, l]) => `${l} ${F.int(g.engines[k])}%`).join(' · ')}</div>` : md === 'rc6' ? `${F.d1(g.util)}%（RC6 活跃度估算）` : md === 'warm' ? '<span class="faint">采样中…</span>' : g.util_avail && ok(g.util) ? F.d1(g.util) + '%' : iu ? `<span class="faint">未能读取</span> ${diagLink()}` : dash(null);
+return kvHTML([['型号', esc(g.name) + (GPU_TAG[g.type] ? ` <span class="pill">${GPU_TAG[g.type]}</span>` : '')], ['利用率', util], ['温度', ok(g.temp) ? F.d1(g.temp) + ' ℃' : iu ? '<span class="faint">核显无独立温度读数（见 CPU 温度）</span>' : dash(null)], ['频率', ok(g.freq_mhz) ? F.int(g.freq_mhz) + ' MHz' + (ok(g.freq_req_mhz) ? `<div class="sub">请求 ${F.int(g.freq_req_mhz)} MHz</div>` : '') : dash(null)], ['显存', +g.mem_total > 0 ? `${F.bytesStr(g.mem_used)} / ${F.bytesStr(g.mem_total)}（${F.d1(g.mem_pct)}%）` : g.shared_memory ? '<span class="faint">与系统共享内存</span>' : dash(null)]]); }).join('') : `<div class="card pad">${emptyHTML('未检测到可监控的显卡', esc(((o.hardware || {}).gpu || []).join('、')))}</div>`);
 };
 },
 },
@@ -3267,6 +3344,7 @@ if (!c0) { b.innerHTML = `<div class="empty"><b>未找到容器 ${esc(a)}</b><sp
 b.innerHTML = `<div class="sheet-hero"><div><div class="eyebrow">CPU</div><div class="dnum"><span class="dm" data-ref="cpu"></span><span class="unit">%</span></div></div><div style="text-align:right"><div class="eyebrow">内存</div><div class="dnum sec"><span class="dm" data-ref="mem"></span><span class="unit" data-ref="memU"></span></div></div></div>
 <div class="ctr-acts" data-ref="acts"></div>
 <div class="card chart-card"><div class="chart-head"><div class="chart-title">CPU · 近几分钟</div><span data-ref="state"></span></div><div style="height:64px" data-ref="sp"></div></div>
+${sec('实时网速', '<span class="faint">30 秒均值</span>')}<div class="stat-cells ctr-rates"><div class="stat-cell"><div class="eyebrow"><i class="ar dn">↓</i>下行 · 接收</div><div class="dnum"><span class="dm" data-ref="rx"></span><span class="unit" data-ref="rxU"></span></div></div><div class="stat-cell"><div class="eyebrow"><i class="ar up">↑</i>上行 · 发送</div><div class="dnum"><span class="dm" data-ref="tx"></span><span class="unit" data-ref="txU"></span></div></div></div><p class="sub ctr-net-note" data-ref="netN"></p>
 ${sec('详情')}<div data-ref="kv"></div>`;
 const x = collect(b), sp = makeSpark(); x.sp.append(sp);
 x.acts.addEventListener('click', e => { const btn = e.target.closest('[data-act]'); if (btn) Docker.act(btn.dataset.id, btn.dataset.name, btn.dataset.act, btn); });
@@ -3279,8 +3357,11 @@ const ids = `data-id="${esc(c.id)}" data-name="${esc(c.name)}"`;
 setHTML(x.acts, pend ? `<span class="spin"></span><span class="pending-t">${Docker.PEND[pend]}</span>` : (run
 ? `<button class="btn" type="button" data-act="restart" ${ids}>${ic('restart')}重启</button><button class="btn danger" type="button" data-act="stop" ${ids}>${ic('stop')}停止</button>`
 : `<button class="btn primary" type="button" data-act="start" ${ids}>${ic('play')}启动</button>`) + (run && hp ? `<a class="btn ghost" href="${esc(location.protocol + '//' + location.hostname + ':' + hp + '/')}" target="_blank" rel="noopener noreferrer">${ic('ext')}打开 :${esc(hp)}</a>` : ''));
+const rOk = ctrRateOk(c);
+dnumU(x.rx, x.rxU, rOk ? +c.rx_rate : null, F.rate); dnumU(x.tx, x.txU, rOk ? +c.tx_rate : null, F.rate);
+setText(x.netN, !run ? '容器未运行' : c.net_host ? 'host 网络模式：与宿主机共用网卡，Docker 不单独统计' : !rOk ? '采样中，约 30 秒后显示' : c.net_src === 'stats' ? '按 docker stats 的累计读数差分估算（只有 3 位有效数字，低速时偏粗）' : '容器网络命名空间计数器差分，精确到字节');
 const bb = S.ctrBuf[c.id]; sp.set([{ values: run && bb && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...(bb || [0])), live: run ? 'ink' : 'none' });
-setHTML(x.kv, kvHTML([['镜像', `<span class="mono">${esc(c.image)}</span>`], ['容器 ID', `<span class="mono">${esc(c.id)}</span>`], ['状态', esc(zhStatus(c.status) || c.state || '--')], ['端口', ctrPorts(c.ports).length ? ctrPorts(c.ports).map(p => `<span class="port">${esc(p)}</span>`).join(' ') : '<span class="faint">无映射</span>'], ['内存', run && c.mem_usage ? `${esc(c.mem_usage)}${c.mem_percent ? `（${esc(c.mem_percent)}%）` : ''}` : '<span class="faint">—</span>'], ['网络 I/O', run && c.net ? esc(c.net) : '<span class="faint">—</span>'], ['创建时间', dash(c.created)]]));
+setHTML(x.kv, kvHTML([['镜像', `<span class="mono">${esc(c.image)}</span>`], ['容器 ID', `<span class="mono">${esc(c.id)}</span>`], ['状态', esc(c.status_zh || zhStatus(c.status) || c.state || '--')], ['端口', ctrPorts(c.ports).length ? ctrPorts(c.ports).map(p => `<span class="port">${esc(p)}</span>`).join(' ') : '<span class="faint">无映射</span>'], ['内存', run && c.mem_usage ? `${esc(c.mem_usage)}${c.mem_percent ? `（${esc(c.mem_percent)}%）` : ''}` : '<span class="faint">—</span>'], ['累计流量', run && !c.net_host && (ok(c.net_in_bytes) || c.net) ? (ok(c.net_in_bytes) && ok(c.net_out_bytes) ? `↓ ${F.bytesStr(c.net_in_bytes)} · ↑ ${F.bytesStr(c.net_out_bytes)}<div class="sub">自容器启动</div>` : esc(c.net)) : '<span class="faint">—</span>'], ['创建时间', dash(c.created)]]));
 };
 },
 },
@@ -3386,6 +3467,14 @@ return ctrRun(c)
 ? `<button class="act" type="button" data-act="restart" ${ids} title="重启" aria-label="重启 ${esc(c.name)}">${ic('restart')}</button><button class="act danger" type="button" data-act="stop" ${ids} title="停止" aria-label="停止 ${esc(c.name)}">${ic('stop')}</button>`
 : `<button class="act go" type="button" data-act="start" ${ids} title="启动" aria-label="启动 ${esc(c.name)}">${ic('play')}</button>`;
 };
+const ctrRateOk = c => ctrRun(c) && ok(c.rx_rate) && ok(c.tx_rate);
+const ctrNetTxt = c => !ctrRun(c) ? '—' : c.net_host ? '宿主网络' : ctrRateOk(c) ? `↓ ${F.rateStr(c.rx_rate)} · ↑ ${F.rateStr(c.tx_rate)}` : '采样中';
+function ctrNetHTML(c) {
+if (!ctrRun(c)) return '<span class="faint">—</span>';
+if (c.net_host) return '<span class="faint" title="host 网络模式与宿主机共用网卡，Docker 不单独统计流量">宿主网络</span>';
+if (!ctrRateOk(c)) return '<span class="faint" title="需要两次采样（约 30 秒）才能算出速率">采样中…</span>';
+return `<b><i class="ar dn">↓</i>${esc(F.rateStr(c.rx_rate))}</b><small><i class="ar up">↑</i>${esc(F.rateStr(c.tx_rate))}</small>`;
+}
 function feedDocker(d) {
 if (!dockerOk(d)) return;
 const now = Date.now(); if (S._ctrFed && now - S._ctrFed < 4000) return; S._ctrFed = now;
@@ -3406,7 +3495,7 @@ body.innerHTML = `<div class="stat-cells dk-sum">
 <div class="stat-cell"><div class="eyebrow">容器内存</div><div class="dnum"><span class="dm" data-ref="sMem"></span><span class="unit" data-ref="sMemU"></span></div><div class="sub" data-ref="sMemT"></div></div>
 <div class="stat-cell"><div class="eyebrow">镜像</div><div class="dnum"><span class="dm" data-ref="sImg"></span></div><div class="sub">本地镜像</div></div>
 </div>
-<div class="card ctr-list"><div class="ctr ctr-head" data-ref="head" hidden><span>容器</span><span>端口</span><span>CPU · 近几分钟</span><span>内存</span><span class="ctr-up">运行时长</span><span></span></div><div data-ref="list"></div>
+<div class="card ctr-list"><div class="ctr ctr-head" data-ref="head" hidden><span>容器</span><span>端口</span><span>CPU · 近几分钟</span><span>内存</span><span class="ctr-net">网络 · 30 秒均值</span><span class="ctr-up">运行时长</span><span></span></div><div data-ref="list"></div>
 <div class="empty" data-ref="empty" hidden><svg class="art" viewBox="0 0 120 84" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M60 10 88 25v30L60 70 32 55V25L60 10Z" stroke-dasharray="3 4"/><path d="M32 25l28 15 28-15M60 40v30"/><circle cx="92" cy="62" r="9"/><path d="m98.5 68.5 7 7"/></svg><b data-ref="emptyT">没有匹配的容器</b><span>换个关键词，或查看全部容器。</span><button class="btn" type="button" data-ref="clear">清除筛选</button></div>
 <div data-ref="na"></div></div>`;
 m.x = collect(body); m.rows = {};
@@ -3431,6 +3520,7 @@ const row = mount(`<div class="ctr" data-name="${esc(c.name)}" tabindex="0" role
 <div class="ports">${ctrPorts(c.ports).length ? ctrPorts(c.ports).slice(0, 4).map(p => `<span class="port">${esc(p)}</span>`).join('') + (ctrPorts(c.ports).length > 4 ? `<span class="port">+${ctrPorts(c.ports).length - 4}</span>` : '') : '<span class="faint" style="font-size:12px">无端口映射</span>'}</div>
 <div class="ctr-cpu"><div class="spk" data-ref="sp"></div><b data-ref="cpu"></b></div>
 <div class="ctr-mem"><b data-ref="mem"></b><small data-ref="memp"></small></div>
+<div class="ctr-net" data-ref="net"></div>
 <div class="ctr-up" data-ref="up"></div>
 <div class="acts" data-ref="acts"></div>
 </div>`);
@@ -3445,6 +3535,7 @@ setCls(r.dot, 'sdot', pend ? 'busy' : on ? '' : 'off');
 setText(r.cpu, on && cpu != null ? F.d1(cpu) + '%' : '—');
 setText(r.mem, on && mem != null ? F.bytesStr(mem) : '—'); setText(r.memp, on && c.mem_percent ? c.mem_percent + '%' : '');
 row._sp.set([{ values: on && bb.length > 1 ? bb : [0, 0] }], { min: 0, max: Math.max(5, ...bb), live: on ? 'ink' : 'none' });
+setHTML(r.net, ctrNetHTML(c));
 setHTML(r.up, pend ? `<span class="pending-t">${Docker.PEND[pend]}</span>` : on ? esc(zhDur(c.uptime || c.status).replace(/^运行\s*/, '')) : `<span class="faint">${esc(zhDur(c.uptime) || c.state || '已停止')}</span>`);
 setHTML(r.acts, pend ? '<span class="spin" aria-label="处理中"></span>' : actBtns(c));
 });

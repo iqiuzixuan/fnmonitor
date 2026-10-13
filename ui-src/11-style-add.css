@@ -104,3 +104,11 @@
 .th-pair .numfield .u { min-width: 18px; }
 [data-theme="dark"] .bays::after { opacity: .35; }
 .module:not(.in-view) .skel, .module:not(.in-view) .fan-ico svg, .module:not(.in-view) .bay-zz .dm { animation-play-state: paused; }
+
+/* ---- 2.18.1：全年估算标记 / 核显活跃度行 / 诊断链接 / 容器实时网速 ---- */
+.est-pill { height: 18px; padding: 0 7px; margin-left: 6px; font-size: 10.5px; vertical-align: 1px; }
+.engine.wide { grid-template-columns: minmax(64px, auto) 1fr 40px; }
+.diag-link { margin: 8px 0 0 -12px; color: var(--ink-3); }
+.diag-link:hover { background: var(--fill-1); color: var(--ink-1); }
+dd .diag-link { margin: 0; height: 24px; }
+.ctr-net-note { margin: 10px 2px 0; }

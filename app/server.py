@@ -57,7 +57,7 @@ def _read_manifest_version():
             pass
     return ""
 
-VERSION = _read_manifest_version() or "2.18.0"   # manifest 不可读时回退（须与 manifest 同步）
+VERSION = _read_manifest_version() or "2.18.1"   # manifest 不可读时回退（须与 manifest 同步）
 UPDATE_REPO = "iqiuzixuan/fnmonitor"       # GitHub 仓库（fork）：在线检查更新 / 下载安装包
 UPDATE_CHECK_INTERVAL = 6 * 3600           # 自动更新检查周期（6 小时）
 # 下载加速：直连 GitHub 下载域在国内常不可达，失败后自动依次尝试公共加速镜像
@@ -1595,27 +1595,99 @@ def read_disk_standby_states():
 
 
 # ===================== Docker NetIO 解析 =====================
+_NETIO_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)\s*([kKmMgGtTpP]?)(i?)[bB]\s*$")
+
+
+def _docker_size_bytes(v):
+    """docker stats 的大小文本 → 字节。docker 用 go-units HumanSize（十进制 kB/MB/GB，
+    基数 1000）；podman 等可能输出二进制 KiB/MiB（基数 1024）。无法解析返回 None。"""
+    m = _NETIO_RE.match(v or "")
+    if not m:
+        return None
+    base = 1024 if m.group(3) else 1000
+    exp = " KMGTP".index(m.group(2).upper()) if m.group(2) else 0
+    try:
+        return int(float(m.group(1)) * base ** exp)
+    except Exception:
+        return None
+
+
 def parse_docker_netio(s):
-    """解析 docker stats 的 NetIO 字段（如 '1.23GB / 4.56GB'）→ (in_bytes, out_bytes) int。"""
+    """解析 docker stats 的 NetIO 字段（如 '145kB / 1.21MB'）→ (in_bytes, out_bytes) int。
+
+    2.18.0 前按 1024 进制且只认大写 KB，docker 实际输出的小写 kB 会被解析成 0。"""
     if not s or "/" not in s:
         return (0, 0)
     parts = s.split("/")
     if len(parts) != 2:
         return (0, 0)
-    units = {"B": 1, "KB": 1024, "MB": 1048576, "GB": 1073741824, "TB": 1099511627776, "PB": 1125899906842624}
-    def to_bytes(v):
-        v = v.strip()
-        for u in sorted(units, key=len, reverse=True):
-            if v.endswith(u):
-                try:
-                    return int(float(v[:-len(u)].strip()) * units[u])
-                except Exception:
-                    return 0
+    a, b = _docker_size_bytes(parts[0]), _docker_size_bytes(parts[1])
+    return (a or 0, b or 0)
+
+
+def _proc_netns_bytes(pid, cid, proc_root="/proc"):
+    """容器网络命名空间的精确累计字节（rx, tx），读 /proc/<pid>/net/dev（排除 lo）。
+
+    docker stats 的 NetIO 只有 3 位有效数字（如 1.21GB，分辨率 10MB），相邻两次差分
+    得到的速率会严重量化；这里直接读内核计数器。安全校验：
+      * /proc/<pid>/cgroup 必须包含完整容器 ID（PID 命名空间不同或 PID 被复用时拒绝）；
+      * 与本进程同一网络命名空间（host 网络模式）时返回 None，避免把宿主机总流量算给容器。
+    任何一步失败返回 None，由调用方回退 docker stats。只读 procfs，不触碰块设备。"""
+    try:
+        pid = int(pid)
+        if pid <= 0 or not cid or len(cid) < 12:
+            return None
+        base = os.path.join(proc_root, str(pid))
+        with open(os.path.join(base, "cgroup"), "r", errors="ignore") as f:
+            if cid not in f.read():
+                return None
         try:
-            return int(float(v))
-        except Exception:
-            return 0
-    return (to_bytes(parts[0]), to_bytes(parts[1]))
+            if os.readlink(os.path.join(base, "ns", "net")) == os.readlink(os.path.join(proc_root, "self", "ns", "net")):
+                return None
+        except OSError:
+            return None
+        rx = tx = 0
+        with open(os.path.join(base, "net", "dev"), "r", errors="ignore") as f:
+            for line in f.readlines()[2:]:
+                if ":" not in line:
+                    continue
+                name, data = line.split(":", 1)
+                if name.strip() == "lo":
+                    continue
+                cols = data.split()
+                if len(cols) >= 9:
+                    rx += int(cols[0])
+                    tx += int(cols[8])
+        return (rx, tx)
+    except Exception:
+        return None
+
+
+def container_net_rates(prev, containers, now):
+    """容器实时网速：相邻两次采样的累计字节差分 / 时间差 → rx_rate / tx_rate（B/s）。
+
+    prev：{容器ID: (ts, in, out, src)}，返回新的 prev。首次采样、计数器回退（容器重启）、
+    计数来源切换（精确 ↔ docker stats）或非运行状态时速率为 None，绝不编造数值。"""
+    nxt = {}
+    for c in containers:
+        c.setdefault("rx_rate", None)
+        c.setdefault("tx_rate", None)
+        cid = c.get("id")
+        if c.get("state") != "running" or c.get("net_src") not in ("proc", "stats"):
+            continue
+        cur = (now, c.get("net_in_bytes") or 0, c.get("net_out_bytes") or 0, c.get("net_src"))
+        nxt[cid] = cur
+        p = (prev or {}).get(cid)
+        if not p or p[3] != cur[3]:
+            continue
+        dt = cur[0] - p[0]
+        di, do = cur[1] - p[1], cur[2] - p[2]
+        if dt <= 0.5 or di < 0 or do < 0:
+            continue
+        c["rx_rate"] = round(di / dt, 1)
+        c["tx_rate"] = round(do / dt, 1)
+        c["rate_window"] = round(dt, 1)
+    return nxt
 
 
 # ===================== GPU 实时监控（网络主流硬件监控面板功能） =====================
@@ -1648,7 +1720,7 @@ def _gpu_ident_list_uncached():
         rest = line.split(":", 1)[1] if ":" in line else line
         name = re.sub(r"\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]", "", rest).strip()
         pci = line.split()[0] if line.split() else ""
-        gtype = "igpu"
+        gtype = "igpu" if vendor == "8086" else "other"
         if vendor == "10de":
             gtype = "nvidia"
         elif vendor == "1002":
@@ -1719,53 +1791,400 @@ def _amd_gpu_busy(pci):
     return None
 
 
-def _intel_igpu_util():
-    """Intel 核显利用率（近似）：根据 i915 频率与 busy 采样估算。读不到返回 (None, False)。"""
-    try:
-        # 优先 i915 的 busy 采样（新版内核 /sys/class/drm/cardN/device/gt/gt0/rps_*）
-        import glob as _glob
-        busy = None
-        for p in _glob.glob("/sys/class/drm/card*/device/gt/gt0/rps_busy"):
-            v = read_int_file(p)
-            if v is not None:
-                busy = v / 10.0  # 单位 10us，占 10000 满分；近似百分比
-                break
-        if busy is not None:
-            return (max(0.0, min(100.0, busy)), False)
-        # 兜底：用 CPU 利用率近似核显负载
-        return (None, True)
-    except Exception:
-        return (None, True)
+# ===================== Intel 核显占用（i915 PMU / RC6，原理同 intel_gpu_top，纯标准库） =====================
+# intel_gpu_top 的做法：通过 perf_event_open 打开 i915 PMU 的各引擎 busy 计数器（单位 ns，
+# 引擎忙碌时累加），两次读数之差 / 墙钟时间 = 引擎占用率。这里用 ctypes 直接发起同一个
+# 系统调用（不依赖 intel-gpu-tools）。读不到 PMU（xe 驱动 / 无权限 / 非 x86）时回退到
+# RC6 驻留时间：GPU 不在 RC6 省电态的时间占比 ≈ 活跃度（只是估算，不区分引擎）。
+_PERF_SYSCALL_NR = {"x86_64": 298, "amd64": 298, "i386": 336, "i686": 336,
+                    "aarch64": 241, "arm64": 241, "armv7l": 364, "armv6l": 364,
+                    "riscv64": 241, "loongarch64": 241}
+_I915_ENGINE_RE = re.compile(r"^(rcs|bcs|vcs|vecs|ccs)(\d+)-busy$")
+_I915_ENGINE_KEY = {"rcs": "render", "bcs": "blitter", "vcs": "video", "vecs": "video_enhance", "ccs": "compute"}
+_I915_FREQ_EVENTS = {"act": ("actual-frequency", "gt0-actual-frequency"),
+                     "req": ("requested-frequency", "gt0-requested-frequency")}
 
 
-def _intel_igpu_top_sample():
-    """Intel 核显顶层采样（freq/power），读不到返回空 dict。"""
-    out = {}
+def _parse_pmu_config(text):
+    """PMU 事件描述（如 'config=0x1000002'）→ config 整数；i915 只用 config= 形式。"""
+    m = re.search(r"(?:^|,)\s*config=(0x[0-9a-fA-F]+|\d+)\s*(?:,|$)", (text or "").strip())
+    return int(m.group(1), 0) if m else None
+
+
+def _first_cpu(mask):
+    """cpumask 文本（'0' / '0-3' / '0,2'）→ 第一个 CPU 编号。"""
+    m = re.match(r"\s*(\d+)", mask or "")
+    return int(m.group(1)) if m else 0
+
+
+def _pci_tag(pci):
+    """lspci 的 '00:02.0' → '00_02.0'（PMU 目录名 i915_0000_00_02.0 的后缀）。"""
+    return (pci or "").strip().replace(":", "_")
+
+
+class _PerfOpener:
+    """perf_event_open(attr, pid=-1, cpu, group_fd=-1, flags=0) 的 ctypes 封装（只读计数）。"""
+
+    def __init__(self, machine=None):
+        import platform
+        self.machine = (machine or platform.machine() or "").lower()
+        self.nr = _PERF_SYSCALL_NR.get(self.machine)
+        self._libc = None
+
+    def __call__(self, ptype, config, cpu):
+        import ctypes
+        import errno as _errno
+        if not self.nr or not is_linux():
+            raise OSError(_errno.ENOSYS, "perf_event_open 不支持该平台（%s）" % (self.machine or "?"))
+        if self._libc is None:
+            self._libc = ctypes.CDLL(None, use_errno=True)
+            self._libc.syscall.restype = ctypes.c_long
+        # struct perf_event_attr（PERF_ATTR_SIZE_VER0 = 64 字节）：type, size, config, sample_period,
+        # sample_type, read_format(0 → read 返回单个 u64), flags(0 → 立即计数), wakeup, bp_type, config1
+        import struct as _struct
+        buf = ctypes.create_string_buffer(_struct.pack("=IIQQQQQIIQ", int(ptype), 64, int(config), 0, 0, 0, 0, 0, 0, 0), 64)
+        fd = self._libc.syscall(ctypes.c_long(self.nr), buf, ctypes.c_int(-1), ctypes.c_int(int(cpu)),
+                                ctypes.c_int(-1), ctypes.c_ulong(0))
+        if fd < 0:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+        return int(fd)
+
+
+def _perf_read(fd):
+    import struct as _struct
+    data = os.read(fd, 8)
+    if len(data) != 8:
+        raise OSError(5, "short read")
+    return _struct.unpack("=Q", data)[0]
+
+
+class IntelGpuPmu:
+    """i915 PMU 引擎占用采样器（线程安全，惰性初始化，失败后退避重试，进程退出时关闭 fd）。
+
+    sysfs / opener / reader / closer / clock 均可注入，便于用夹具目录与假计数器测试。"""
+    RETRY_S = 300.0       # 初始化失败后的重试间隔（不刷日志、不空转）
+    REREAD_RETRY_S = 30.0  # 读数失败（如 GPU 复位）后多久重新初始化
+
+    def __init__(self, sysfs="/sys", opener=None, reader=None, closer=None, clock=None, paranoid_path=None):
+        self.sysfs = sysfs
+        self.opener = opener or _PerfOpener()
+        self.reader = reader or _perf_read
+        self.closer = closer or os.close
+        self.clock = clock or time.monotonic
+        self.paranoid_path = paranoid_path or "/proc/sys/kernel/perf_event_paranoid"
+        self._lock = threading.Lock()
+        self._fds = {}            # 事件名 → fd
+        self._events = {}         # 事件名 → (类别键, 实例号) 或 ('freq', 'act'/'req')
+        self._prev = None
+        self._last = None
+        self._next_init = 0.0
+        self._diag = {"initialized": False}
+
+    def _pmu_dir(self, pci):
+        base = os.path.join(self.sysfs, "bus", "event_source", "devices")
+        try:
+            names = sorted(n for n in os.listdir(base) if n == "i915" or n.startswith("i915_"))
+        except OSError:
+            names = []
+        self._diag["pmu_candidates"] = names
+        tag = _pci_tag(pci)
+        for n in names:
+            if tag and n.startswith("i915_") and n.endswith(tag):
+                return os.path.join(base, n)
+        if "i915" in names:
+            return os.path.join(base, "i915")
+        return os.path.join(base, names[0]) if names else None
+
+    def _close(self):
+        for fd in self._fds.values():
+            try:
+                self.closer(fd)
+            except Exception:
+                pass
+        self._fds = {}
+        self._prev = None
+
+    def _init(self, pci):
+        self._close()
+        d = {"initialized": True, "pmu_dir": None, "events": {}, "open": {}, "error": None,
+             "perf_event_paranoid": (read_text(self.paranoid_path) or "").strip() or None,
+             "machine": getattr(self.opener, "machine", None), "syscall_nr": getattr(self.opener, "nr", None)}
+        self._diag = d
+        pdir = self._pmu_dir(pci)
+        d["pmu_candidates"] = self._diag.get("pmu_candidates", [])
+        if not pdir:
+            d["error"] = "未找到 i915 PMU（/sys/bus/event_source/devices/i915*）"
+            return
+        d["pmu_dir"] = pdir
+        try:
+            ptype = int((read_text(os.path.join(pdir, "type")) or "").strip())
+        except ValueError:
+            d["error"] = "PMU type 不可读"
+            return
+        d["type"] = ptype
+        mask = (read_text(os.path.join(pdir, "cpumask")) or "").strip()
+        d["cpumask"] = mask or None
+        cpu = _first_cpu(mask)
+        evdir = os.path.join(pdir, "events")
+        try:
+            names = sorted(n for n in os.listdir(evdir) if "." not in n)
+        except OSError:
+            d["error"] = "PMU events 目录不可读"
+            return
+        wanted = {}
+        for n in names:
+            m = _I915_ENGINE_RE.match(n)
+            if m:
+                wanted[n] = (_I915_ENGINE_KEY[m.group(1)], int(m.group(2)))
+        for k, cands in _I915_FREQ_EVENTS.items():
+            for c in cands:
+                if c in names:
+                    wanted[c] = ("freq", k)
+                    break
+        d["events_all"] = len(names)
+        for n, meaning in sorted(wanted.items()):
+            cfg = _parse_pmu_config(read_text(os.path.join(evdir, n)))
+            unit = (read_text(os.path.join(evdir, n + ".unit")) or "").strip() or None
+            d["events"][n] = {"config": hex(cfg) if cfg is not None else None, "unit": unit}
+            if cfg is None:
+                d["open"][n] = {"ok": False, "error": "config 无法解析"}
+                continue
+            try:
+                fd = self.opener(ptype, cfg, cpu)
+                self._fds[n] = fd
+                self._events[n] = meaning
+                d["open"][n] = {"ok": True}
+            except OSError as e:
+                d["open"][n] = {"ok": False, "errno": e.errno, "strerror": e.strerror or str(e)}
+            except Exception as e:   # ctypes 不可用等
+                d["open"][n] = {"ok": False, "error": str(e)[:200]}
+        if not any(m[0] != "freq" for n, m in self._events.items() if n in self._fds):
+            d["error"] = d["error"] or "引擎 busy 事件均未能打开（见 open）"
+            self._close()
+
+    def sample(self, pci=None):
+        """返回 {'engines', 'util', 'freq_act', 'freq_req'}；首次采样返回 {'warming': True}；
+        PMU 不可用返回 None。不阻塞：只做 read()。"""
+        with self._lock:
+            now = self.clock()
+            if not self._fds:
+                if now < self._next_init:
+                    return None
+                self._init(pci)
+                if not self._fds:
+                    self._next_init = now + self.RETRY_S
+                    return None
+            try:
+                vals = {n: int(self.reader(fd)) for n, fd in self._fds.items()}
+            except Exception as e:
+                self._diag["error"] = "读取计数器失败：%s" % (str(e)[:200],)
+                self._close()
+                self._next_init = now + self.REREAD_RETRY_S
+                return None
+            prev, self._prev = self._prev, (now, vals)
+            self._diag["last_raw"] = {"t": round(now, 3), "values": vals}
+            if not prev:
+                return {"warming": True}
+            dt = now - prev[0]
+            if dt < 0.2:
+                return self._last or {"warming": True}
+            engines, freq = {}, {}
+            for n, v in vals.items():
+                if n not in prev[1]:
+                    continue
+                dv = v - prev[1][n]
+                if dv < 0:                       # 计数器回绕 / GPU 复位：以本次为新基线
+                    self._last = {"warming": True}
+                    return self._last
+                kind, sub = self._events[n]
+                if kind == "freq":
+                    freq[sub] = dv / dt          # MHz·s 累计 → MHz
+                else:
+                    pct = max(0.0, min(100.0, dv / (dt * 1e9) * 100.0))
+                    engines[kind] = max(engines.get(kind, 0.0), pct)   # 同类多实例（vcs0/vcs1）取最忙的
+            engines = {k: round(v, 1) for k, v in engines.items()}
+            self._last = {"engines": engines, "util": max(engines.values()) if engines else None,
+                          "freq_act": round(freq["act"]) if "act" in freq else None,
+                          "freq_req": round(freq["req"]) if "req" in freq else None}
+            return self._last
+
+    def diag(self):
+        with self._lock:
+            return json.loads(json.dumps(self._diag))
+
+    def close(self):
+        with self._lock:
+            self._close()
+
+
+def _drm_cards(sysfs="/sys"):
+    """[(card 路径, PCI 地址, 驱动名)]（只读 sysfs 链接，不访问设备）。"""
+    out = []
+    base = os.path.join(sysfs, "class", "drm")
     try:
-        import glob as _glob
-        for p in _glob.glob("/sys/class/drm/card*/gt_cur_freq_mhz"):
-            v = read_int_file(p)
-            if v is not None:
-                out["freq_mhz"] = v
-                break
-        for p in _glob.glob("/sys/class/drm/card*/device/power/runtime_active_time"):
-            pass  # 功耗需两次差分，此处省略
-    except Exception:
-        pass
+        names = sorted(n for n in os.listdir(base) if re.match(r"^card\d+$", n))
+    except OSError:
+        return out
+    for n in names:
+        p = os.path.join(base, n)
+        try:
+            pci = os.path.basename(os.path.realpath(os.path.join(p, "device")))
+        except Exception:
+            pci = ""
+        try:
+            drv = os.path.basename(os.readlink(os.path.join(p, "device", "driver")))
+        except OSError:
+            drv = None
+        out.append((p, pci, drv))
     return out
 
 
-def _gpu_memory_bytes():
-    """Intel 核显共享系统内存（近似）。返回 (used, total, pct)。"""
+def _card_for(pci, sysfs="/sys"):
+    cards = _drm_cards(sysfs)
+    tag = (pci or "").strip()
+    for c in cards:
+        if tag and c[1].endswith(tag):
+            return c
+    for c in cards:
+        if c[2] in ("i915", "xe"):
+            return c
+    return None
+
+
+class GpuIdleResidency:
+    """RC6（i915）/ gtidle（xe）驻留时间 → 活跃度估算：100 − Δ空闲 ms / Δ墙钟 ms × 100。"""
+    PATHS = ("gt/gt0/rc6_residency_ms", "power/rc6_residency_ms",
+             "device/tile0/gt0/gtidle/idle_residency_ms")
+
+    def __init__(self, sysfs="/sys", clock=None):
+        self.sysfs = sysfs
+        self.clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._prev = None
+        self.path = None
+
+    def _find(self, pci):
+        c = _card_for(pci, self.sysfs)
+        if not c:
+            return None
+        for rel in self.PATHS:
+            p = os.path.join(c[0], rel)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def sample(self, pci=None):
+        with self._lock:
+            if not self.path:
+                self.path = self._find(pci)
+                if not self.path:
+                    return None
+            t = read_text(self.path).strip()
+            v = int(t) if t.isdigit() else None
+            now = self.clock()
+            if v is None:
+                self.path = None
+                self._prev = None
+                return None
+            prev, self._prev = self._prev, (now, v)
+            if not prev or now - prev[0] < 0.2:
+                return {"warming": True}
+            dv = v - prev[1]
+            if dv < 0:                            # 32 位计数回绕：重新取基线
+                return {"warming": True}
+            idle = dv / ((now - prev[0]) * 1000.0) * 100.0
+            return {"util": round(max(0.0, min(100.0, 100.0 - idle)), 1)}
+
+
+def _intel_gpu_freq(pci, sysfs="/sys"):
+    """核显当前频率 MHz（sysfs；优先实际频率 act，其次 cur）。"""
+    c = _card_for(pci, sysfs)
+    if not c:
+        return None
+    for rel in ("gt_act_freq_mhz", "gt/gt0/rps_act_freq_mhz", "device/tile0/gt0/freq0/act_freq",
+                "gt_cur_freq_mhz", "gt/gt0/rps_cur_freq_mhz", "device/tile0/gt0/freq0/cur_freq"):
+        v = read_int_file(os.path.join(c[0], rel))
+        if v:
+            return v
+    return None
+
+
+_INTEL_SAMPLERS = {}           # pci → (IntelGpuPmu, GpuIdleResidency)
+_INTEL_SAMPLERS_LOCK = threading.Lock()
+
+
+def _intel_samplers(pci):
+    with _INTEL_SAMPLERS_LOCK:
+        s = _INTEL_SAMPLERS.get(pci)
+        if s is None:
+            s = _INTEL_SAMPLERS[pci] = (IntelGpuPmu(), GpuIdleResidency())
+        return s
+
+
+def _close_intel_samplers():
+    with _INTEL_SAMPLERS_LOCK:
+        for pmu, _ in _INTEL_SAMPLERS.values():
+            try:
+                pmu.close()
+            except Exception:
+                pass
+
+
+import atexit as _atexit
+_atexit.register(_close_intel_samplers)
+
+
+def intel_gpu_usage(pci, pmu=None, idle=None, sysfs="/sys"):
+    """Intel 核显占用：PMU 引擎占用优先，否则 RC6 活跃度估算，都不可用返回 util=None。"""
+    if pmu is None or idle is None:
+        pmu, idle = _intel_samplers(pci)
+    out = {"util": None, "util_source": None, "engines": None, "freq_mhz": None, "freq_req_mhz": None,
+           "warming": False}
+    r = pmu.sample(pci)
+    if r is not None:
+        out["util_source"] = "pmu"
+        if r.get("warming"):
+            out["warming"] = True
+        else:
+            out["engines"] = r.get("engines") or None
+            out["util"] = r.get("util")
+            out["freq_mhz"] = r.get("freq_act")
+            out["freq_req_mhz"] = r.get("freq_req")
+    else:
+        q = idle.sample(pci)
+        if q is not None:
+            out["util_source"] = "rc6"
+            out["warming"] = bool(q.get("warming"))
+            out["util"] = q.get("util")
+    if out["freq_mhz"] is None:
+        out["freq_mhz"] = _intel_gpu_freq(pci, sysfs)
+    return out
+
+
+def intel_gpu_diag(pci=None, sysfs="/sys", pmu=None, idle=None):
+    """/api/gpu?diag=1：核显读数诊断（PMU / RC6 / 驱动 / 内核），不含任何机密信息。"""
+    if pmu is None or idle is None:
+        pmu, idle = _intel_samplers(pci)
     try:
-        mem = read_meminfo()
-        total = mem.get("total", 0)
-        used = mem.get("used", 0)
-        if total > 0:
-            return (used, total, round(used / total * 100, 1))
+        rel = os.uname().release
     except Exception:
-        pass
-    return (None, None, None)
+        rel = None
+    try:
+        sources = sorted(os.listdir(os.path.join(sysfs, "bus", "event_source", "devices")))
+    except OSError:
+        sources = []
+    return {
+        "kernel": rel,
+        "pci": pci,
+        "event_sources": sources[:64],
+        "perf_event_paranoid": (read_text("/proc/sys/kernel/perf_event_paranoid") or "").strip() or None,
+        "perf_syscall": {"machine": getattr(pmu.opener, "machine", None), "nr": getattr(pmu.opener, "nr", None)},
+        "drm_cards": [{"card": os.path.basename(c[0]), "pci": c[1], "driver": c[2]} for c in _drm_cards(sysfs)],
+        "pmu": pmu.diag(),
+        "rc6_path": idle.path,
+        "freq_mhz_sysfs": _intel_gpu_freq(pci, sysfs),
+    }
 
 
 def collect_gpu():
@@ -1781,6 +2200,7 @@ def collect_gpu():
         mem_used = None
         mem_total = None
         mem_pct = None
+        extra = {"util_source": None, "engines": None}
         try:
             if g["vendor"] == "10de":  # NVIDIA
                 s, _ = run_cmd(["nvidia-smi", "--query-gpu=utilization.gpu,utilization.memory,temperature.gpu,memory.used,memory.total",
@@ -1838,21 +2258,17 @@ def collect_gpu():
                             break
                 except Exception:
                     pass
-            else:  # Intel 核显 / 无核显
-                temp = read_temps().get("cpu")
-                sample = _intel_igpu_top_sample()
-                if sample.get("freq_mhz") is not None:
-                    freq_mhz = sample["freq_mhz"]
-                u, u_proxy = _intel_igpu_util()
-                if u is not None:
-                    util = u
+            elif g["vendor"] == "8086":  # Intel 核显：i915 PMU 引擎占用 / RC6 活跃度估算
+                # 不再用 CPU 温度冒充 GPU 温度、用系统内存冒充显存（核显没有独立温度与显存读数）
+                iu = intel_gpu_usage(g["pci"])
+                extra.update(util_source=iu["util_source"], engines=iu["engines"],
+                             freq_req_mhz=iu["freq_req_mhz"], warming=iu["warming"], shared_memory=True)
+                freq_mhz = iu["freq_mhz"]
+                if iu["util"] is not None:
+                    util = iu["util"]
                     util_avail = True
-                    util_proxy = u_proxy
-                mu, mt, mp = _gpu_memory_bytes()
-                if mt:
-                    mem_used, mem_total, mem_pct = mu, mt, mp
         except Exception:
-            pass
+            traceback.print_exc()
         res.append({
             "vendor": g["vendor"], "type": g["type"], "name": g["name"], "pci": g["pci"],
             "temp": (round(temp, 1) if isinstance(temp, (int, float)) else None),
@@ -1862,6 +2278,9 @@ def collect_gpu():
             "mem_used": mem_used, "mem_total": mem_total, "mem_pct": mem_pct,
             "util_avail": util_avail, "util_proxy": util_proxy,
         })
+        res[-1].update(extra)
+        if res[-1]["util_source"] is None and util_avail:
+            res[-1]["util_source"] = "driver"
     return res
 
 
@@ -2697,37 +3116,100 @@ def _ip_show(addr):
 # ---------------------------------------------------------------------------
 # Docker 采集
 # ---------------------------------------------------------------------------
+_DK_UNIT_ZH = {"second": "秒", "minute": "分钟", "hour": "小时", "day": "天", "week": "周",
+               "month": "个月", "year": "年"}
+_DK_DUR_RE = re.compile(r"(?:(\d+)|an?)\s+(second|minute|hour|day|week|month|year)s?\b", re.I)
+
+
+def _docker_dur_zh(text):
+    """go-units HumanDuration（docker / podman 的 Status 时长）→ 中文。
+
+    覆盖全部形式：'Less than a second' / '1 second' / '5 seconds' / 'About a minute' /
+    '3 minutes' / 'About an hour' / '10 hours' / '3 days' / '2 weeks' / '4 months' / '2 years'。
+    无法识别时返回 ''（调用方据此只显示状态，不残留英文）。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    if low.startswith("less than a second"):
+        return "不到 1 秒"
+    about = low.startswith("about ")
+    m = _DK_DUR_RE.search(t)
+    if not m:
+        return ""
+    n = int(m.group(1)) if m.group(1) else 1
+    unit = _DK_UNIT_ZH[m.group(2).lower()]
+    return ("约 " if about else "") + "%d %s" % (n, unit)
+
+
+_DK_HEALTH_ZH = {"healthy": "健康", "unhealthy": "不健康", "health: starting": "健康检查中"}
+
+
+def parse_docker_status(status):
+    """解析 docker ps 的 Status 字段 → dict（全部中文，不残留英文单位）。
+
+    docker 的全部形式（moby container/state.go）：
+      'Up 3 days' / 'Up About an hour' / 'Up 5 seconds (healthy)' / 'Up 2 hours (Paused)' /
+      'Up 1 minute (health: starting)' / 'Restarting (1) 3 seconds ago' /
+      'Exited (0) 2 weeks ago' / 'Created' / 'Dead' / 'Removal In Progress'；
+    podman 另有 'Paused' / 'Stopped' / 'Configured' / 'Initialized'。
+    返回 {uptime, status_zh, health, exit_code, dur}：
+      uptime   列表用短文本（如「运行 3 天」「已停止 2 周」）
+      status_zh 详情用完整文本（如「运行 3 天 · 健康」「已停止（退出码 0）· 2 周前」）"""
+    s = (status or "").strip()
+    out = {"uptime": "", "status_zh": "", "health": None, "exit_code": None, "dur": ""}
+    if not s:
+        return out
+    low = s.lower()
+    hm = re.search(r"\((healthy|unhealthy|health: starting)\)", low)
+    if hm:
+        out["health"] = {"healthy": "healthy", "unhealthy": "unhealthy"}.get(hm.group(1), "starting")
+    health_zh = _DK_HEALTH_ZH.get(hm.group(1)) if hm else ""
+    paused = "(paused)" in low
+    em = re.search(r"\((-?\d+)\)", s)
+    code = int(em.group(1)) if em and not low.startswith("up") else None
+    out["exit_code"] = code
+    body = re.sub(r"\s*\([^)]*\)", "", s).strip()          # 去掉 (healthy) / (0) 等括号
+    ago = bool(re.search(r"\bago$", body, re.I))
+    body = re.sub(r"\s+ago$", "", body, flags=re.I)
+    if low.startswith("up "):
+        dur = _docker_dur_zh(body[3:])
+        out["dur"] = dur
+        if paused:
+            out["uptime"] = "已暂停" + (" · 已运行 " + dur if dur else "")
+            out["status_zh"] = out["uptime"]
+        else:
+            out["uptime"] = ("运行 " + dur) if dur else "运行中"
+            out["status_zh"] = out["uptime"] + (" · " + health_zh if health_zh else "")
+        return out
+    first = low.split(" ", 1)[0]
+    rest = body.split(" ", 1)[1] if " " in body else ""
+    dur = _docker_dur_zh(rest)
+    out["dur"] = dur
+    code_zh = "（退出码 %d）" % code if code is not None else ""
+    if first in ("exited", "stopped"):
+        out["uptime"] = "已停止" + (" " + dur if dur else "")
+        out["status_zh"] = "已停止" + code_zh + (" · " + dur + ("前" if ago else "") if dur else "")
+    elif first == "restarting":
+        out["uptime"] = "重启中"
+        out["status_zh"] = "重启中" + code_zh + (" · " + dur + "前退出" if dur else "")
+    elif first == "paused":
+        out["uptime"] = out["status_zh"] = "已暂停"
+    elif first in ("created", "configured", "initialized"):
+        out["uptime"] = out["status_zh"] = "已创建"
+    elif first == "dead":
+        out["uptime"] = out["status_zh"] = "已失效"
+    elif low.startswith("removal"):
+        out["uptime"] = out["status_zh"] = "删除中"
+    else:
+        # 未知形式：不回显英文原文，交给前端用 state 兜底
+        out["uptime"] = out["status_zh"] = ""
+    return out
+
+
 def _docker_uptime_zh(status):
     """把 docker Status（如 'Up 3 hours' / 'Exited (0) 5 minutes ago'）转成中文运行时长。"""
-    if not status:
-        return ""
-    s = status.strip()
-    low = s.lower()
-    if low.startswith("up "):
-        rest = s[3:].strip()
-        # 处理 "About an hour" / "2 days" 等
-        rest = rest.replace("about ", "约 ")
-        n = re.search(r"(\d+)", rest)
-        if not n:
-            return "运行中"
-        num = n.group(1)
-        unit = rest[n.end():].strip().lower()
-        unit_zh = {"seconds": "秒", "second": "秒", "minutes": "分钟", "minute": "分钟",
-                   "hours": "小时", "hour": "小时", "days": "天", "day": "天", "weeks": "周", "week": "周",
-                   "months": "个月", "month": "个月"}.get(unit, unit)
-        return "运行 " + num + unit_zh
-    if low.startswith("exited"):
-        m = re.search(r"exited.*?(\d+) (minutes|hours|days|seconds)", low)
-        if m:
-            return "已停止 " + m.group(1) + m.group(2)
-        return "已停止"
-    if low.startswith("restarting"):
-        return "重启中"
-    if low.startswith("paused"):
-        return "已暂停"
-    if low.startswith("created"):
-        return "已创建"
-    return s
+    return parse_docker_status(status)["uptime"]
 
 
 def collect_docker():
@@ -2749,16 +3231,25 @@ def collect_docker():
             c = json.loads(line)
         except Exception:
             continue
+        st = parse_docker_status(c.get("Status") or "")
+        nets_ = [x.strip() for x in str(c.get("Networks") or "").split(",") if x.strip()]
         containers.append({
             "id": (c.get("ID") or "")[:12],
             "name": (c.get("Names") or "").lstrip("/"),
             "image": c.get("Image") or "",
             "state": c.get("State") or "",
             "status": c.get("Status") or "",
-            "uptime": _docker_uptime_zh(c.get("Status") or ""),
+            "uptime": st["uptime"],
+            "status_zh": st["status_zh"],
+            "health": st["health"],
+            "exit_code": st["exit_code"],
             "ports": c.get("Ports") or "",
             "created": c.get("CreatedAt") or "",
+            "networks": nets_,
+            # host 网络模式与宿主机共用网卡，docker 不单独统计其流量（速率恒为 None）
+            "net_host": nets_ == ["host"],
             "cpu": "", "mem_usage": "", "mem_percent": "", "net": "",
+            "rx_rate": None, "tx_rate": None, "net_src": None,
         })
     # 运行中容器的资源占用
     sout, src = run_cmd(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=40)
@@ -2783,6 +3274,24 @@ def collect_docker():
                 in_b, out_b = parse_docker_netio(s.get("NetIO", ""))
                 c["net_in_bytes"] = in_b
                 c["net_out_bytes"] = out_b
+                if not c["net_host"] and c["state"] == "running":
+                    c["net_src"] = "stats"
+        # 运行中容器的精确网络计数（docker inspect 取 PID → /proc/<pid>/net/dev），失败回退 stats
+        run_ids = [c["id"] for c in containers if c["state"] == "running" and not c["net_host"]]
+        if run_ids and is_linux():
+            iout, irc = run_cmd(["docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}"] + run_ids[:200], timeout=20)
+            pids = {}
+            for line in (iout or "").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and re.match(r"^[0-9a-f]{64}$", parts[0]) and parts[1].isdigit():
+                    pids[parts[0][:12]] = (parts[0], parts[1])
+            for c in containers:
+                ent = pids.get(c["id"])
+                got = _proc_netns_bytes(ent[1], ent[0]) if ent else None
+                if got:
+                    c["net_in_bytes"], c["net_out_bytes"] = got
+                    c["net_src"] = "proc"
+    result["sampled_at"] = time.time()
     # 状态排序：运行中优先
     order = {"running": 0, "restarting": 1, "paused": 2, "exited": 3, "created": 4, "dead": 5}
     containers.sort(key=lambda c: order.get(c["state"], 9))
@@ -3546,6 +4055,11 @@ class History:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_ms_ym ON monthly_summary(year DESC, month DESC)")
                 # 元数据（月度归档水位线等）
                 conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+                # 每日汇总（近 30 天用电 / 流量柱、全年估算）：按本地自然日累加，
+                # 水位线 meta.daily_archived_until 保证每行 metrics 只计入一次；不受 retention 清理影响
+                conn.execute("""CREATE TABLE IF NOT EXISTS daily_summary (
+                    day TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
+                    PRIMARY KEY (day, metric))""")
                 # 自愈：v2.8.0 前的历史写入曾把 (指标名, 时间戳) 两列互换（ts 列存了文本），
                 # 这些脏行永远查不出来还会拖慢查询，启动时一次性清除
                 conn.execute("DELETE FROM metrics WHERE typeof(ts) != 'real'")
@@ -3993,7 +4507,178 @@ class History:
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (repr(float(target)),))
         return n
 
-    def cleanup(self, retention_days, archive_enabled=False):
+    # ---- 每日汇总（水位线，与月度归档同一思路） ----
+    # meta.daily_archived_until = W 表示 ts < W 的 metrics 行都已累加进 daily_summary。
+    # 每次只汇总 [W, target) 并在同一事务内推进 W：重复调用 / 进程重启 / 反复 cleanup
+    # 都不会重复累加。daily_summary 每天每指标一行（PRIMARY KEY(day, metric)）：
+    #   kwh      功率 W 对时间积分（相邻采样间隔；超过 3 倍采样间隔视为停机断档，按一个间隔计）
+    #   power_s  有功率数据覆盖的秒数（判断「不完整的一天」、求平均功率）
+    #   rx_phys / tx_phys  物理网口（非 lo、非虚拟前缀）累计字节计数器的增量
+    #   rx_virt / tx_virt  虚拟网口（docker/veth/br-…）增量；接口按 traffic_exclude_bridge 决定是否计入
+    #   cpu_sum / cpu_n / cpu_max  CPU 占用 % 的和 / 采样数 / 峰值
+    # 计数器回退（重启归零）时增量取新值本身（开机以来的字节），与 Prometheus increase() 相同。
+    DAILY_KEEP_DAYS = 400
+    DAILY_CHUNK = 7 * 86400
+    _DAILY_MAX_KEYS = ("cpu_max",)
+    _UPSERT_DAILY_ADD = ("INSERT INTO daily_summary(day, metric, value) VALUES(?,?,?) "
+                         "ON CONFLICT(day, metric) DO UPDATE SET value = daily_summary.value + excluded.value")
+    _UPSERT_DAILY_MAX = ("INSERT INTO daily_summary(day, metric, value) VALUES(?,?,?) "
+                         "ON CONFLICT(day, metric) DO UPDATE SET value = MAX(daily_summary.value, excluded.value)")
+
+    @staticmethod
+    def _day_start(ts):
+        lt = time.localtime(ts)
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+    @staticmethod
+    def _day_keyer():
+        """ts → 本地日期 'YYYY-MM-DD'（缓存当天边界，逐行调用只做两次比较）。"""
+        box = [1.0, 0.0, ""]
+
+        def key(ts):
+            if not (box[0] <= ts < box[1]):
+                lt = time.localtime(ts)
+                box[0] = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+                box[1] = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+                box[2] = "%04d-%02d-%02d" % (lt.tm_year, lt.tm_mon, lt.tm_mday)
+            return box[2]
+        return key
+
+    def _daily_watermark(self, conn):
+        r = conn.execute("SELECT value FROM meta WHERE key='daily_archived_until'").fetchone()
+        if r:
+            try:
+                return float(r[0]), True
+            except Exception:
+                pass
+        # 首次：从 DAILY_KEEP_DAYS 天前的 0 点开始（库里实际只有保留期内的数据）
+        return self._day_start(time.time() - self.DAILY_KEEP_DAYS * 86400), False
+
+    def _daily_aggregate(self, conn, start, end, default_dt=60):
+        """汇总 metrics 中 start <= ts < end 的行 → {(day, key): value}。只读，可用于实时尾段。"""
+        acc = {}
+        dk = self._day_keyer()
+
+        def add(day, k, v):
+            acc[(day, k)] = acc.get((day, k), 0.0) + v
+
+        def prev_row(metric):
+            return conn.execute("SELECT ts, value FROM metrics WHERE metric=? AND ts<? ORDER BY ts DESC LIMIT 1",
+                                (metric, start)).fetchone()
+
+        def rows(metric):
+            cur = conn.execute("SELECT ts, value FROM metrics WHERE metric=? AND ts>=? AND ts<? ORDER BY ts",
+                               (metric, start, end))
+            while True:
+                chunk = cur.fetchmany(5000)
+                if not chunk:
+                    return
+                for r in chunk:
+                    yield r
+
+        # 功率 → kWh：与 2.18.0 月度 kWh 修复同口径（按采样间隔积分，不受行数上限截断），
+        # 每个采样代表它之前的一个间隔；断档（> 3 倍间隔）只按一个典型间隔计
+        pr = prev_row("power")
+        pts = list(rows("power"))
+        if pts:
+            ts_list = ([pr[0]] if pr else []) + [t for t, _ in pts]
+            dts = sorted(ts_list[i + 1] - ts_list[i] for i in range(len(ts_list) - 1)
+                         if ts_list[i + 1] > ts_list[i])
+            med = dts[len(dts) // 2] if dts else float(default_dt)
+            cap = 3.0 * max(med, float(default_dt or 0))
+            last = pr[0] if pr else None
+            for t, v in pts:
+                gap = (t - last) if last is not None else None
+                dt = gap if (gap is not None and 0 < gap <= cap) else med
+                last = t
+                day = dk(t)
+                add(day, "kwh", (v or 0.0) * dt / 3600000.0)
+                add(day, "power_s", dt)
+        # CPU 占用：日均 / 峰值
+        for t, v in rows("cpu"):
+            day = dk(t)
+            add(day, "cpu_sum", v or 0.0)
+            add(day, "cpu_n", 1.0)
+            k = (day, "cpu_max")
+            if k not in acc or v > acc[k]:
+                acc[k] = float(v)
+        # 网口累计字节计数器 → 每日增量
+        for prefix, kk in (("net_rx_bytes:", "rx"), ("net_tx_bytes:", "tx")):
+            for metric in self._distinct_metrics(conn, prefix):
+                iface = metric.split(":", 1)[1]
+                if iface == "lo":
+                    continue
+                key = kk + ("_virt" if iface.startswith(VIRT_IFACE_PREFIXES) else "_phys")
+                p = prev_row(metric)
+                pv = p[1] if p else None
+                for t, v in rows(metric):
+                    if pv is not None:
+                        d = v - pv
+                        add(dk(t), key, d if d >= 0 else v)
+                    else:
+                        add(dk(t), key, 0.0)   # 首个采样：只标记「有数据」，没有基准不计增量
+                    pv = v
+        return acc
+
+    def archive_daily(self, target, default_dt=60):
+        """把 [水位线, target) 的 metrics 汇总进 daily_summary（分 7 天一段、每段独立事务）。"""
+        conn = self._connect(write=True)
+        n = 0
+        try:
+            wm, _ = self._daily_watermark(conn)
+            while wm < target:
+                end = min(float(target), wm + self.DAILY_CHUNK)
+                with conn:
+                    agg = self._daily_aggregate(conn, wm, end, default_dt)
+                    for (day, k), v in agg.items():
+                        conn.execute(self._UPSERT_DAILY_MAX if k in self._DAILY_MAX_KEYS else self._UPSERT_DAILY_ADD,
+                                     (day, k, v))
+                        n += 1
+                    conn.execute("INSERT INTO meta(key, value) VALUES('daily_archived_until', ?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (repr(end),))
+                wm = end
+            keep = time.strftime("%Y-%m-%d", time.localtime(time.time() - self.DAILY_KEEP_DAYS * 86400))
+            with conn:
+                conn.execute("DELETE FROM daily_summary WHERE day < ?", (keep,))
+        finally:
+            conn.close()
+        return n
+
+    def daily_rows(self, days, default_dt=60):
+        """最近 days 天（含今天）的每日汇总：已归档部分 + 水位线之后的实时尾段（只读，不写库）。
+
+        返回 {day: {key: value}}；休眠时返回上次结果（不读库，不唤醒硬盘）。"""
+        key = ("daily", int(days))
+        if self._asleep():
+            return self._memo(key, None) or {}
+        now = time.time()
+        first = time.strftime("%Y-%m-%d", time.localtime(self._day_start(now) - (int(days) - 1) * 86400 + 3600))
+        out = {}
+        try:
+            conn = self._connect()
+            try:
+                for day, k, v in conn.execute("SELECT day, metric, value FROM daily_summary WHERE day >= ?", (first,)):
+                    out.setdefault(day, {})[k] = v
+                wm, has = self._daily_watermark(conn)
+                # 尚未做过首次归档时（刚升级、首个整点维护前）只实时汇总今天，避免请求线程扫全库
+                tail_start = wm if has else max(wm, self._day_start(now))
+                for (day, k), v in self._daily_aggregate(conn, tail_start, now + 1, default_dt).items():
+                    if day < first:
+                        continue
+                    d = out.setdefault(day, {})
+                    if k in self._DAILY_MAX_KEYS:
+                        d[k] = max(d.get(k, v), v)
+                    else:
+                        d[k] = d.get(k, 0.0) + v
+            finally:
+                conn.close()
+        except Exception:
+            traceback.print_exc()
+            return {}
+        out["_meta"] = {"archived_until": wm if has else None}
+        return self._memo(key, out)
+
+    def cleanup(self, retention_days, archive_enabled=False, daily_target=None, default_dt=60):
         """删除过期历史；开启上月汇总时先在同一事务内归档到水位线。
         归档目标 = max(保留期截止点, 本月 1 日 0 点)：上月数据在月初即完整归档，
         即将删除的本月早期数据也在删除前归档。按指标逐个 DELETE（走 idx_metric_ts），
@@ -4013,6 +4698,13 @@ class History:
                 except Exception:
                     traceback.print_exc()
                     print("[fnmonitor] 月度汇总归档失败，本次仅清理过期数据")
+            # 每日汇总：始终开启（数据量极小），删除前先把即将删除与最近的数据都汇总到水位线
+            try:
+                tgt = time.time() - 600 if daily_target is None else daily_target
+                self.archive_daily(max(tgt, cutoff), default_dt=default_dt)
+            except Exception:
+                traceback.print_exc()
+                print("[fnmonitor] 每日汇总失败，本次仅清理过期数据")
             with conn:
                 for metric in self._distinct_metrics(conn):
                     conn.execute("DELETE FROM metrics WHERE metric=? AND ts<?", (metric, cutoff))
@@ -4051,6 +4743,7 @@ class Collector(threading.Thread):
         self._prev_disk_percent = {}
         self._last_docker = None
         self._last_docker_ts = 0.0
+        self._ctr_net_prev = {}   # 容器 ID → (ts, 累计入, 累计出, 计数来源)，用于实时网速差分
         self._last_modules = []
         self._last_modules_ts = 0.0
         self._last_apps = []
@@ -4362,7 +5055,13 @@ class Collector(threading.Thread):
             try:
                 # 开启上月汇总时，cleanup 前先把即将删除的数据按月叠加归档
                 archive = bool(int(self.config.get("monthly_summary_enabled", 0) or 0))
-                self.db.cleanup(self.config.get("retention_days", 7), archive_enabled=archive)
+                # 每日汇总的水位线不能越过尚未落盘的休眠暂存行（它们稍后才以原时间戳补写）
+                dtarget = now - 600
+                if self._pending_rows:
+                    dtarget = min(dtarget, min(r[0] for r in self._pending_rows) - 1)
+                hist_iv = int(self.config.get("history_interval", DEFAULT_CONFIG["history_interval"]) or 60)
+                self.db.cleanup(self.config.get("retention_days", 7), archive_enabled=archive,
+                                daily_target=dtarget, default_dt=hist_iv)
             except Exception:
                 pass
 
@@ -4373,6 +5072,13 @@ class Collector(threading.Thread):
         if now - self._last_docker_ts >= 30:
             self._last_docker = collect_docker()
             self._last_docker_ts = now
+            # 容器实时网速：与上一轮的累计字节差分（约 30 秒窗口均值）
+            try:
+                self._ctr_net_prev = container_net_rates(
+                    self._ctr_net_prev, self._last_docker.get("containers") or [],
+                    self._last_docker.get("sampled_at") or now)
+            except Exception:
+                traceback.print_exc()
         snapshot["docker"] = self._last_docker
 
         # ---- 功能模块（每 60 秒；systemctl / docker images / ss 均为外部进程调用） ----
@@ -4897,6 +5603,7 @@ class MonitorApp:
         self._traffic_ts = 0.0
         self._power_stats_cache = None
         self._power_stats_ts = 0.0
+        self._daily_cache = {}   # days → (ts, 每日汇总)，60 秒复用
         self._disk_standby_cache = None
         self._disk_standby_ts = 0.0
         # ---- 登录鉴权：会话持久化到 配置目录/sessions.json（0600，只存 sid 哈希），内存缓存加速校验 ----
@@ -5186,7 +5893,7 @@ class MonitorApp:
                     self._json(app.api_power_stats())
                     return
                 if path == "/api/gpu":
-                    self._json(app.api_gpu())
+                    self._json(app.api_gpu(diag=(qs.get("diag") or ["0"])[0] in ("1", "true")))
                     return
                 if path == "/api/memory":
                     self._json(app.api_memory())
@@ -5196,6 +5903,9 @@ class MonitorApp:
                     return
                 if path == "/api/monthly_summary":
                     self._json(app.api_monthly_summary())
+                    return
+                if path == "/api/daily":
+                    self._json(app.api_daily((qs.get("days") or ["30"])[0]))
                     return
                 if path == "/api/update/check":
                     force = (qs.get("force") or ["0"])[0] in ("1", "true", "yes")
@@ -6127,10 +6837,19 @@ class MonitorApp:
                 if fl:
                     total += max(0, fl[1] - fl[0])
             return total
-        today_rx = _period_totals("net_rx_bytes:", today_sec)
-        today_tx = _period_totals("net_tx_bytes:", today_sec)
-        month_rx = _period_totals("net_rx_bytes:", month_sec)
-        month_tx = _period_totals("net_tx_bytes:", month_sec)
+        # 优先用每日汇总（与「近 30 天流量」柱同源：跨重启的计数器归零也能正确累加，
+        # 本月合计不受 retention_days 截断）；不可用时回退为区间首尾差
+        dm = self._daily_today_month()
+        if dm and dm["has_net"]:
+            today_rx, today_tx = dm["today_rx"] or 0, dm["today_tx"] or 0
+            month_rx, month_tx = dm["month_rx"] or 0, dm["month_tx"] or 0
+            totals_basis = "daily"
+        else:
+            today_rx = _period_totals("net_rx_bytes:", today_sec)
+            today_tx = _period_totals("net_tx_bytes:", today_sec)
+            month_rx = _period_totals("net_rx_bytes:", month_sec)
+            month_tx = _period_totals("net_tx_bytes:", month_sec)
+            totals_basis = "history"
         # 容器流量 TOP
         containers = []
         docker_data = snap.get("docker", {})
@@ -6145,6 +6864,8 @@ class MonitorApp:
                     "in_bytes": in_b,
                     "out_bytes": out_b,
                     "total_bytes": in_b + out_b,
+                    "rx_rate": c.get("rx_rate"),
+                    "tx_rate": c.get("tx_rate"),
                 })
             containers.sort(key=lambda x: -x["total_bytes"])
         result = {
@@ -6154,6 +6875,7 @@ class MonitorApp:
                 "boot_rx": boot_rx, "boot_tx": boot_tx,
                 "today_rx": today_rx, "today_tx": today_tx,
                 "month_rx": month_rx, "month_tx": month_tx,
+                "basis": totals_basis,
             },
             "containers": containers[:20],
             "config": {"exclude_bridge": exclude_bridge},
@@ -6182,8 +6904,17 @@ class MonitorApp:
         def _kwh_from_history(seconds):
             # SQL 聚合整个区间（旧版受 query 默认 LIMIT 7200 限制，月初 5 天后本月 kWh 偏低）
             return self.collector.db.energy_kwh("power", seconds, default_dt=hist_interval)
-        today_kwh = _kwh_from_history(today_sec)
-        month_kwh = _kwh_from_history(month_sec)
+        # 优先用每日汇总（与「近 30 天用电」柱同源；本月合计不受 retention_days 截断），
+        # 汇总不可用时回退为直接对保留期内的功率历史积分
+        dm = self._daily_today_month()
+        if dm and dm["has_power"]:
+            today_kwh = round(dm["today_kwh"] or 0.0, 4)
+            month_kwh = round(dm["month_kwh"] or 0.0, 4)
+            energy_basis = "daily"
+        else:
+            today_kwh = _kwh_from_history(today_sec)
+            month_kwh = _kwh_from_history(month_sec)
+            energy_basis = "history"
         # 开机累计估算
         uptime = snap.get("uptime", 0)
         boot_kwh = round(power_w * uptime / 3_600_000, 4) if uptime > 0 else 0.0
@@ -6205,7 +6936,8 @@ class MonitorApp:
                          "base": power.get("base"),
                          "disks_w": power.get("disks_w", 0),
                          "disks_active": power.get("disks_active")},
-            "energy": {"today_kwh": today_kwh, "month_kwh": month_kwh, "boot_kwh": boot_kwh},
+            "energy": {"today_kwh": today_kwh, "month_kwh": month_kwh, "boot_kwh": boot_kwh,
+                       "basis": energy_basis},
             "cost": {"today_yuan": round(today_kwh * rate, 2), "month_yuan": round(month_kwh * rate, 2), "rate_yuan_per_kwh": rate},
             "disks": standby,
             "standby_protect": bool(int(self.config.get("disk_standby_protect", 1) or 0)),
@@ -6219,6 +6951,88 @@ class MonitorApp:
         self._power_stats_cache = result
         self._power_stats_ts = now
         return result
+
+    def _daily_data(self, days):
+        """每日汇总（60 秒缓存；多客户端 / 多面板共用）。"""
+        days = max(1, min(int(days), History.DAILY_KEEP_DAYS))
+        now = time.time()
+        c = self._daily_cache.get(days)
+        if c and now - c[0] < 60:
+            return c[1]
+        hist_iv = int(self.config.get("history_interval", DEFAULT_CONFIG["history_interval"]) or 60)
+        data = self.collector.db.daily_rows(days, default_dt=hist_iv)
+        if len(self._daily_cache) > 8:
+            self._daily_cache.clear()
+        self._daily_cache[days] = (now, data)
+        return data
+
+    def api_daily(self, days=30):
+        """近 N 天（含今天，本地自然日）的每日汇总：用电 kWh / 电费 / 物理网口流量 / CPU。
+
+        days 列表按日期升序、每天一项；某项没有任何数据时该字段为 null（不是 0），
+        has_data=false 表示当天完全没有采样（未运行 / 早于安装）。
+        kwh 为功率历史积分（RAPL 实测或模型估算，与能耗面板同源）；power_h 为当天有功率数据
+        覆盖的小时数，< 24 表示当天数据不完整。rx/tx 口径与流量统计一致：排除 lo，
+        traffic_exclude_bridge 开启时排除 docker/veth 等虚拟网口。"""
+        try:
+            days = int(days)
+        except Exception:
+            days = 30
+        days = max(1, min(days, History.DAILY_KEEP_DAYS))
+        data = self._daily_data(max(days, 31)) or {}   # 统一取 ≥31 天，图表与今日/本月合计共用一份缓存
+        meta = data.get("_meta") or {}
+        rate = float(self.config.get("power_rate_yuan", 0.6) or 0)
+        exclude_bridge = bool(int(self.config.get("traffic_exclude_bridge", 0) or 0))
+        now = time.time()
+        start = History._day_start(now)
+        out = []
+        for i in range(days - 1, -1, -1):
+            day = time.strftime("%Y-%m-%d", time.localtime(start - i * 86400 + 3600))
+            d = data.get(day) or {}
+            kwh = d.get("kwh") if "power_s" in d else None
+            has_net = any(k in d for k in ("rx_phys", "tx_phys", "rx_virt", "tx_virt"))
+            rx = tx = None
+            if has_net:
+                rx = d.get("rx_phys", 0.0) + (0.0 if exclude_bridge else d.get("rx_virt", 0.0))
+                tx = d.get("tx_phys", 0.0) + (0.0 if exclude_bridge else d.get("tx_virt", 0.0))
+            n = d.get("cpu_n") or 0
+            out.append({
+                "day": day,
+                "has_data": bool(d),
+                "kwh": round(kwh, 4) if kwh is not None else None,
+                "cost": round(kwh * rate, 2) if kwh is not None else None,
+                "power_h": round(d["power_s"] / 3600.0, 2) if "power_s" in d else None,
+                "avg_w": round(kwh * 3600000.0 / d["power_s"], 1) if kwh is not None and d.get("power_s") else None,
+                "rx": int(rx) if rx is not None else None,
+                "tx": int(tx) if tx is not None else None,
+                "cpu_avg": round(d.get("cpu_sum", 0.0) / n, 1) if n else None,
+                "cpu_max": round(d["cpu_max"], 1) if n and "cpu_max" in d else None,
+            })
+        return {"days": out, "rate": rate, "today": out[-1]["day"] if out else None,
+                "exclude_bridge": exclude_bridge, "missing": "null",
+                "archived_until": meta.get("archived_until"),
+                "power_source": (self.collector.get_snapshot().get("power") or {}).get("source")}
+
+    def _daily_today_month(self):
+        """今日 / 本月合计（来自每日汇总，不受 retention 影响）。读不到返回 None。"""
+        try:
+            now = time.time()
+            mday = time.localtime(now).tm_mday
+            j = self.api_daily(max(mday, 1))
+        except Exception:
+            traceback.print_exc()
+            return None
+        days = j.get("days") or []
+        if not days or not days[-1].get("has_data"):
+            return None
+        month = time.strftime("%Y-%m-", time.localtime(now))
+        mine = [d for d in days if d["day"].startswith(month)]
+        sm = lambda k: sum((d.get(k) or 0) for d in mine)
+        t = days[-1]
+        return {"today_kwh": t.get("kwh"), "month_kwh": sm("kwh"),
+                "today_rx": t.get("rx"), "today_tx": t.get("tx"),
+                "month_rx": sm("rx"), "month_tx": sm("tx"),
+                "has_power": t.get("kwh") is not None, "has_net": t.get("rx") is not None}
 
     def api_net_bytes_history(self, range_):
         """各网卡累计字节时间序列（聚合 net_rx_bytes:* / net_tx_bytes:*，SQL 内降采样）。"""
@@ -6318,9 +7132,20 @@ class MonitorApp:
                 yield self._csv_line([self._iso(cur_ts), "%.3f" % cur_ts, cur["power"], cur.get("power_est", "")])
         return gen()
 
-    def api_gpu(self):
-        """GPU 实时监控。"""
-        return {"gpu": self.collector.get_snapshot().get("gpu", [])}
+    def api_gpu(self, diag=False):
+        """GPU 实时监控；diag=True 时附带核显读数诊断（PMU / RC6 / 驱动，可直接贴到问题反馈）。"""
+        gpus = self.collector.get_snapshot().get("gpu", [])
+        out = {"gpu": gpus}
+        if diag:
+            intel = [g for g in gpus if g.get("vendor") == "8086"]
+            pci = intel[0].get("pci") if intel else None
+            try:
+                out["diag"] = intel_gpu_diag(pci)
+                out["diag"]["intel_gpu_found"] = bool(intel)
+                out["diag"]["version"] = VERSION
+            except Exception as e:
+                out["diag"] = {"error": str(e)[:200]}
+        return out
 
     def api_memory(self):
         """内存插槽 SPD。"""
