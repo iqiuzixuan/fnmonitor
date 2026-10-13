@@ -57,7 +57,7 @@ def _read_manifest_version():
             pass
     return ""
 
-VERSION = _read_manifest_version() or "2.18.2"   # manifest 不可读时回退（须与 manifest 同步）
+VERSION = _read_manifest_version() or "2.18.3"   # manifest 不可读时回退（须与 manifest 同步）
 UPDATE_REPO = "iqiuzixuan/fnmonitor"       # GitHub 仓库（fork）：在线检查更新 / 下载安装包
 UPDATE_CHECK_INTERVAL = 6 * 3600           # 自动更新检查周期（6 小时）
 # 下载加速：直连 GitHub 下载域在国内常不可达，失败后自动依次尝试公共加速镜像
@@ -316,7 +316,7 @@ class LoginLimiter:
 
 
 def sanitize_ignored(raw):
-    """校验「已忽略的健康提醒」（v2.18.2）：[{key, fp, label, level, at}]，最多 100 条。
+    """校验「已忽略的健康提醒」（v2.18.3）：[{key, fp, label, level, at}]，最多 100 条。
     key 标识问题、fp 为忽略时的状态指纹（前端比较指纹变化即重新提醒）；只保留字符串 / 数字，限制长度。"""
     out, seen = [], set()
     if not isinstance(raw, list):
