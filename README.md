@@ -1,14 +1,14 @@
 # 飞牛监控 fnMonitor
 
 <p>
-  <img alt="Version" src="https://img.shields.io/badge/version-2.18.4-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-2.19.0-blue">
   <img alt="fnOS" src="https://img.shields.io/badge/fnOS-x86%20%7C%20arm64-success">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-orange">
 </p>
 
 飞牛 fnOS 系统监控应用（FPK 原生应用）：实时监控 **CPU / 内存 / 磁盘 / 网络 / 温度 / 功耗 / GPU**，支持 Docker 容器管理、端口占用、硬盘 SMART、历史趋势与提醒阈值，深浅色 + 5 种主色。**流量统计模块**（整机 / 网卡 / 容器上下行流量、今日 / 本月累计、容器流量排行、CSV 导出）与**功耗统计模块**（实时瓦数 + kWh 耗电量 + 电费估算，无 RAPL 时自动回退 TDP 估算模型，CSV 导出）。纯 Python 标准库 + 单文件前端，**零第三方依赖、完全离线可用**，数据仅保存在本机。
 
-- 当前版本：**v2.18.4**
+- 当前版本：**v2.19.0**
 - 作者：**Misite齊**（原作）· fork 维护：**iqiuzixuan**
 - 适用平台：fnOS **x86 + arm64**（最低系统版本 0.9.0）
 - 默认端口：**8777**（安装向导可改）
@@ -43,7 +43,7 @@ https://raw.githubusercontent.com/iqiuzixuan/fnmonitor/main/fnpack.json
 
 ### 方式二：手动安装 FPK
 
-1. 到 [Releases](https://github.com/iqiuzixuan/fnmonitor/releases) 按 NAS 架构下载：`fnmonitor-2.18.4-x86.fpk`（x86 机型）或 `fnmonitor-2.18.4-arm.fpk`（arm64 机型）
+1. 到 [Releases](https://github.com/iqiuzixuan/fnmonitor/releases) 按 NAS 架构下载：`fnmonitor-2.19.0-x86.fpk`（x86 机型）或 `fnmonitor-2.19.0-arm.fpk`（arm64 机型）
 2. 飞牛 OS → **应用中心** → 左下角 **手动安装** → 选择 fpk 文件
 3. 安装后从桌面打开 **飞牛监控**，或直接访问 `http://<NAS_IP>:8777`
 
@@ -115,6 +115,7 @@ make_icon.py            应用图标生成（不覆盖已有图标）
 
 | 版本 | 内容 |
 |---|---|
+| v2.19.0 | **新增「虚拟机」页面**：监控飞牛虚拟机的 CPU / 内存 / 磁盘读写 / 网速 / IP 与磁盘、网卡详情，支持开机 / 关机 / 重启 / 挂起 / 恢复 / 强制关机（危险操作二次确认、可撤销）；显示飞牛中设置的名称、系统与开机自启；本机未启用虚拟机功能时自动隐藏 |
 | v2.18.4 | **应用日志不再刷屏**：状态轮询不再写日志，只记录启动 / 停止 / 重启 / 失败（带时间、版本与端口） |
 | v2.18.3 | **健康检查忽略 + 新图标**：问题项可手动忽略，设置中查看与恢复，项目变化时自动重新提醒；全新点阵应用图标与网站 favicon；修复天气自动定位开关无法关闭、暗色模式开关项闪白块、没有容器时误报 Docker 不可用；长连接关闭 Nagle，接口延迟降低约 40ms；新增 CI 回归测试 |
 | v2.18.1 | **核显占用实测 + 容器实时网速 + 近 30 天按天统计**：直接读取 i915 内核性能计数器显示各引擎占用（读不到时按 RC6 估算，附 `/api/gpu?diag=1` 诊断），去掉核显温度 / 显存的近似冒充；容器列表与详情显示实时下行 / 上行速率；新增按天汇总，近 30 天用电与流量柱状图使用真实每日数据，今日 / 本月统计不再受历史保留天数影响；全年电费估算；修复容器状态英文单位与 Docker 流量单位解析错误 |
