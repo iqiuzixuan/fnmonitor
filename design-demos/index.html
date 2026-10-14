@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞牛监控 · 重设计方案</title>
+<style>
+  :root{--bg:#f4f4f2;--ink:#151515;--mute:#6b6b6b;--line:rgba(0,0,0,.08);color-scheme:light}
+  @media (prefers-color-scheme:dark){:root{--bg:#0d0d0e;--ink:#ececec;--mute:#8a8a8f;--line:rgba(255,255,255,.08);color-scheme:dark}}
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei UI",system-ui,sans-serif;padding:56px 32px 80px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto}
+  h1{font-size:40px;letter-spacing:-.02em;font-weight:700}
+  .lead{color:var(--mute);margin-top:10px;max-width:720px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-top:40px}
+  a.card{display:flex;flex-direction:column;text-decoration:none;color:inherit;border:1px solid var(--line);border-radius:22px;overflow:hidden;background:color-mix(in srgb,var(--bg) 60%,#fff 40%);transition:transform .25s cubic-bezier(.2,.8,.2,1),box-shadow .25s}
+  a.card:hover{transform:translateY(-4px);box-shadow:0 24px 48px -24px rgba(0,0,0,.35)}
+  .sw{height:180px;display:flex;align-items:flex-end;padding:22px;gap:8px}
+  .a .sw{background:#0b0c0e;color:#e8eaed;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .b .sw{background:#f6f5f1;color:#1c1c1e}
+  .c .sw{background:#ededed;color:#0e0e0e}
+  .big{font-size:56px;line-height:1;font-weight:600;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+  .a .big{color:#ff6b2c;font-weight:500}
+  .c .big{font-family:"SF Mono",ui-monospace,monospace;letter-spacing:.06em}
+  .c .big i{color:#d71921;font-style:normal}
+  .d .sw{background:#ECECEA radial-gradient(rgba(14,14,14,.08) 1px,transparent 1.3px) 0 0/14px 14px;color:#0e0e0e;align-items:stretch}
+  .d .tile{flex:1.4;min-width:0;background:#fff;border-radius:18px;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between}
+  .d .tile small{font:500 10px/1 "SF Mono",ui-monospace,monospace;letter-spacing:.14em;color:#a9a9a6}
+  .d .tile b{font-size:15px;font-weight:650;letter-spacing:-.01em}
+  .d .big{font-family:"SF Mono",ui-monospace,monospace;letter-spacing:.02em;font-size:34px;white-space:nowrap}
+  .d .big i{color:#d71921;font-style:normal}
+  .meta{padding:20px 22px 24px}
+  .meta h2{font-size:19px;font-weight:650}
+  .meta p{color:var(--mute);font-size:13.5px;margin-top:6px}
+  .tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:14px}
+  .tags span{font-size:12px;border:1px solid var(--line);border-radius:99px;padding:2px 10px;color:var(--mute)}
+  .note{margin-top:40px;color:var(--mute);font-size:13px;border-top:1px solid var(--line);padding-top:20px}
+  code{font-family:"SF Mono",ui-monospace,monospace;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>飞牛监控 · 重设计方案</h1>
+  <p class="lead">三个方向 + 一个融合版使用同一份模拟数据（i3-N305 · 32 GB · 5 块盘 · 10 个容器，每 2 秒实时推进），可直接对比。每个方案都包含 总览 / 容器 / 设置 三页，支持深浅色、编辑布局、键盘快捷键与移动端。</p>
+  <div class="grid">
+    <a class="card a" href="a-observatory/">
+      <div class="sw"><span class="big">17.4</span><span style="color:#8b9099;font-size:12px">CPU %<br>8C/8T</span></div>
+      <div class="meta"><h2>A · 观测台 Observatory</h2><p>深色优先的专业仪器风格。等宽大数字、细线分隔、高密度信息，单一信号色。为喜欢数据的人设计。</p>
+        <div class="tags"><span>⌘K 命令面板</span><span>联动十字准星</span><span>硬盘机架视图</span><span>高密度</span></div></div>
+    </a>
+    <a class="card b" href="b-calm/">
+      <div class="sw" style="flex-direction:column;align-items:flex-start;justify-content:flex-end"><span style="font-size:13px;color:#6e6e73">晚上好</span><span style="font-size:26px;font-weight:650;letter-spacing:-.01em">fnOS-Home 运行良好</span></div>
+      <div class="meta"><h2>B · 静 Calm</h2><p>浅色优先的编辑式设计。一句话结论 + 大字指标，详情按需从侧边抽屉展开。为想"看一眼就安心"的家庭用户设计。</p>
+        <div class="tags"><span>自然语言洞察</span><span>渐进式披露</span><span>侧边详情抽屉</span><span>留白</span></div></div>
+    </a>
+    <a class="card c" href="c-bento/">
+      <div class="sw"><span class="big">41<i>.</i>8W</span></div>
+      <div class="meta"><h2>C · 机体 Hardware Bento</h2><p>单色工业风 + 点阵数字的便当格布局。把 NAS 画成实体：硬盘仓位指示灯、核心矩阵、内存条。辨识度最高。</p>
+        <div class="tags"><span>点阵字体</span><span>硬件实体可视化</span><span>磁贴原地展开</span><span>iOS 式编辑</span></div></div>
+    </a>
+    <a class="card d" href="d-hybrid/">
+      <div class="sw"><div class="tile"><small>01 AT A GLANCE</small><b>fnOS-Home 运行良好</b></div><div class="tile" style="flex:.85;justify-content:flex-end"><span class="big">41<i>.</i>8<small style="font-size:14px;letter-spacing:0;color:#6b6b6b;margin-left:4px">W</small></span></div></div>
+      <div class="meta"><h2>D · 融合版 Hybrid</h2><p>B 的布局交互 + C 的卡片配色与点阵数字。保留一句话结论、侧边详情抽屉、同步十字准星与编辑布局；换上单色磁贴、信号红实时点与 5×7 点阵读数。</p>
+        <div class="tags"><span>B 的布局与动效</span><span>C 的单色磁贴</span><span>点阵数字</span><span>无反色磁贴</span></div></div>
+    </a>
+  </div>
+  <p class="note">D 为独立页面（无风格切换器，设置单独保存）。B 与 C 已互通：两页顶栏都有「静 / 机体」切换器（设置 → 外观里也有），切换时保留当前页面与深浅色。C 默认关闭反色磁贴，可在 设置 → 外观 → 反色磁贴 打开。<br>方案选定后，可在其基础上混搭其它方案的局部（例如 A 的命令面板 + B 的详情抽屉），再进入 <code>app/www/index.html</code> 的正式重构，接入真实 API 与现有七套主题。</p>
+</div>
+</body>
+</html>
